@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Compare Databases</title>
+  <style>
+    :root {
+      --bg: #1e1e2e;
+      --panel-bg: #2b2b36;
+      --accent: #9f191e; /* Deep Red matching the logo */
+      --text: #d4d4d4;
+      --success: #00FA9A;
+      --error: #FF6347;
+    }
+    * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    body { margin: 0; display: flex; height: 100vh; background: var(--bg); color: var(--text); }
+    .sidebar { width: 320px; background: #a00707; padding: 30px 25px; display: flex; flex-direction: column; }
+    .main { flex: 1; display: flex; flex-direction: column; padding: 25px; }
+    h1 { margin-top: 0; font-size: 32px; font-weight: bold; color: white; margin-bottom: 30px; }
+    .form-group { margin-bottom: 20px; }
+    input, select { width: 100%; padding: 14px; background: #313244; border: 1px solid #45475a; color: white; border-radius: 6px; outline: none; font-size: 14px; }
+    input:focus { border-color: var(--accent); }
+    button { padding: 14px; border: none; background: var(--accent); color: white; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; font-size: 14px; }
+    button:hover { background: #004a80; }
+    button:disabled { background: #45475a; cursor: not-allowed; color: #8e8e8e; }
+    .btn-green { background: #228B22; }
+    .btn-green:hover { background: #006400; }
+    .status { margin-top: 15px; font-size: 14px; color: #a6adc8; font-weight: bold; }
+    
+    .topbar { display: flex; gap: 20px; background: var(--panel-bg); padding: 20px; border-radius: 8px; align-items: center; margin-bottom: 20px; }
+    .topbar > div { flex: 1; display: flex; align-items: center; gap: 15px; }
+    .topbar label { font-weight: bold; font-size: 15px; white-space: nowrap; }
+    
+    .action-bar { display: flex; justify-content: space-between; margin: 0 0 15px 0; align-items: center; }
+    
+    .editor { flex: 1; background: #1e1e1e; border: 1px solid #313244; border-radius: 8px; padding: 20px; font-family: 'Consolas', monospace; font-size: 15px; overflow-y: auto; color: #d4d4d4; white-space: pre-wrap; line-height: 1.5; }
+    
+    .keyword { color: #569CD6; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+  <div class="sidebar">
+    <div style="text-align: center;">
+      <img src="super-cashier.png" style="width: 140px; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.5);">
+      <h1 style="margin-top: 20px; font-size: 26px;">Compare Databases</h1>
+    </div>
+    
+    <div class="form-group">
+      <input type="text" id="host" placeholder="Host (e.g. 127.0.0.1)" value="127.0.0.1">
+    </div>
+    <div class="form-group">
+      <input type="text" id="user" placeholder="Username" value="root">
+    </div>
+    <div class="form-group">
+      <input type="password" id="pass" placeholder="Password">
+    </div>
+    
+    <button id="connectBtn" style="width: 100%">Connect to MySQL</button>
+    <div class="status" id="status">Not Connected</div>
+  </div>
+
+  <div class="main">
+    <div class="topbar">
+      <div>
+        <label>Source DB:</label>
+        <select id="sourceCb" disabled><option>Connect first...</option></select>
+      </div>
+      <div>
+        <label>Target DB:</label>
+        <select id="targetCb" disabled><option>Connect first...</option></select>
+      </div>
+    </div>
+
+    <div class="action-bar">
+      <button class="btn-green" id="compareBtn" disabled>▶ Compare Databases</button>
+      <button id="copyBtn" disabled>📋 Copy SQL</button>
+    </div>
+
+    <div class="editor" id="editor"></div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    const connectBtn = document.getElementById('connectBtn');
+    const compareBtn = document.getElementById('compareBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const sourceCb = document.getElementById('sourceCb');
+    const targetCb = document.getElementById('targetCb');
+    const statusEl = document.getElementById('status');
+    const editorEl = document.getElementById('editor');
+
+    let currentSQL = "";
+
+    function syntaxHighlight(sql) {
+      const keywords = ['CREATE TABLE', 'ALTER TABLE', 'ADD COLUMN', 'MODIFY COLUMN', 'NOT NULL', 'DEFAULT', 'PRIMARY KEY', 'FOREIGN KEY', 'REFERENCES', 'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'ON', 'AND', 'OR', 'IS', 'NULL', 'INT', 'VARCHAR', 'TEXT', 'DATETIME', 'BOOLEAN'];
+      let highlighted = sql.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      keywords.forEach(kw => {
+        const regex = new RegExp(`\\b${kw}\\b`, 'gi');
+        highlighted = highlighted.replace(regex, `<span class="keyword">${kw}</span>`);
+      });
+      return highlighted;
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      statusEl.textContent = "Connecting...";
+      statusEl.style.color = "#a6adc8";
+      
+      const host = document.getElementById('host').value;
+      const user = document.getElementById('user').value;
+      const password = document.getElementById('pass').value;
+
+      const res = await ipcRenderer.invoke('connect-db', { host, user, password });
+      
+      if(res.success) {
+        statusEl.textContent = "✅ Connected";
+        statusEl.style.color = "var(--success)";
+        
+        sourceCb.innerHTML = '';
+        targetCb.innerHTML = '';
+        res.dbs.forEach(db => {
+          sourceCb.innerHTML += `<option value="${db}">${db}</option>`;
+          targetCb.innerHTML += `<option value="${db}">${db}</option>`;
+        });
+        
+        sourceCb.disabled = false;
+        targetCb.disabled = false;
+        compareBtn.disabled = false;
+      } else {
+        statusEl.textContent = "❌ Connection Failed";
+        statusEl.style.color = "var(--error)";
+        alert(res.error);
+      }
+    });
+
+    compareBtn.addEventListener('click', async () => {
+      const source = sourceCb.value;
+      const target = targetCb.value;
+      
+      if(source === target) {
+        alert("Source and Target cannot be the same.");
+        return;
+      }
+      
+      editorEl.innerHTML = "Generating...";
+      const res = await ipcRenderer.invoke('compare-db', { source, target });
+      
+      if(res.success) {
+        currentSQL = res.sql.trim();
+        if(currentSQL) {
+          editorEl.innerHTML = syntaxHighlight(currentSQL);
+          copyBtn.disabled = false;
+          statusEl.textContent = "✅ Sync Script Generated";
+        } else {
+          editorEl.innerHTML = "";
+          copyBtn.disabled = true;
+          statusEl.textContent = "✅ Databases are identical";
+        }
+      } else {
+        editorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
+      }
+    });
+
+    copyBtn.addEventListener('click', async () => {
+      if(currentSQL) {
+        await ipcRenderer.invoke('copy-to-clipboard', currentSQL);
+        statusEl.textContent = "✅ Copied to clipboard";
+      }
+    });
+  </script>
+</body>
+</html>

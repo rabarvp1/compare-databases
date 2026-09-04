@@ -1,0 +1,30 @@
+{
+  "name": "compare-databases",
+  "version": "1.0.8",
+  "description": "Compare Databases",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.rabar.comparedatabases",
+    "productName": "Compare Databases",
+    "win": {
+      "target": "nsis",
+      "icon": "super-cashier.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": true
+    }
+  },
+  "dependencies": {
+    "mysql2": "^3.9.0"
+  },
+  "devDependencies": {
+    "electron": "^30.0.1",
+    "electron-builder": "^24.13.3"
+  }
+}
