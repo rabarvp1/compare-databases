@@ -13,53 +13,122 @@
     }
     * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
     body { margin: 0; display: flex; height: 100vh; background: var(--bg); color: var(--text); }
-    .sidebar { width: 320px; background: #a00707; padding: 30px 25px; display: flex; flex-direction: column; }
-    .main { flex: 1; display: flex; flex-direction: column; padding: 25px; }
+    /* Sized to fit without scrolling; overflow stays scrollable on very small windows, just without a visible bar */
+    .sidebar { width: 340px; background: #181825; border-right: 1px solid #313244; padding: 14px 16px; display: flex; flex-direction: column; overflow-y: auto; scrollbar-width: none; }
+    .sidebar::-webkit-scrollbar { display: none; }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .brand img { width: 44px; }
+    .brand h1 { margin: 0; font-size: 20px; }
+    ::-webkit-scrollbar { width: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #45475a; border-radius: 5px; }
+    ::-webkit-scrollbar-thumb:hover { background: #585b70; }
+    .main { flex: 1; display: flex; flex-direction: column; padding: 25px; min-width: 0; }
     h1 { margin-top: 0; font-size: 32px; font-weight: bold; color: white; margin-bottom: 30px; }
-    .form-group { margin-bottom: 20px; }
-    input, select { width: 100%; padding: 14px; background: #313244; border: 1px solid #45475a; color: white; border-radius: 6px; outline: none; font-size: 14px; }
+    .form-group { margin-bottom: 6px; }
+    input, select { width: 100%; padding: 7px 10px; background: #313244; border: 1px solid #45475a; color: white; border-radius: 6px; outline: none; font-size: 14px; }
     input:focus { border-color: var(--accent); }
-    button { padding: 14px; border: none; background: var(--accent); color: white; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; font-size: 14px; }
+    button { padding: 12px; border: none; background: var(--accent); color: white; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; font-size: 14px; }
     button:hover { background: #004a80; }
     button:disabled { background: #45475a; cursor: not-allowed; color: #8e8e8e; }
     .btn-green { background: #228B22; }
     .btn-green:hover { background: #006400; }
-    .status { margin-top: 15px; font-size: 14px; color: #a6adc8; font-weight: bold; }
-    
+    .powered { font-size: 11px; color: #7f849c; letter-spacing: 0.3px; }
+    .status { margin-top: 6px; font-size: 13px; color: #a6adc8; font-weight: bold; overflow-wrap: anywhere; }
+
+    .conn { background: var(--panel-bg); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+    .conn-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .conn-head h2 { margin: 0; font-size: 16px; color: white; }
+    .conn-head button { padding: 5px 10px; font-size: 12px; background: #45475a; }
+    .row { display: flex; gap: 8px; }
+    .conn .connect { width: 100%; padding: 9px; }
+
     .topbar { display: flex; gap: 20px; background: var(--panel-bg); padding: 20px; border-radius: 8px; align-items: center; margin-bottom: 20px; }
-    .topbar > div { flex: 1; display: flex; align-items: center; gap: 15px; }
+    .topbar > div { flex: 1; display: flex; align-items: center; gap: 15px; min-width: 0; }
     .topbar label { font-weight: bold; font-size: 15px; white-space: nowrap; }
-    
+    .mode { font-size: 13px; color: #a6adc8; margin: 0 0 15px 0; }
+
     .action-bar { display: flex; justify-content: space-between; margin: 0 0 15px 0; align-items: center; }
-    
+
     .editor { flex: 1; background: #1e1e1e; border: 1px solid #313244; border-radius: 8px; padding: 20px; font-family: 'Consolas', monospace; font-size: 15px; overflow-y: auto; color: #d4d4d4; white-space: pre-wrap; line-height: 1.5; }
-    
+
+    .update { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 12px; color: #a6adc8; white-space: nowrap; }
+    .tab { white-space: nowrap; flex-shrink: 0; }
+    #updateMsg { display: none; margin: -5px 0 15px; padding: 10px 14px; border-radius: 6px; font-size: 14px; line-height: 1.4;
+                 background: var(--panel-bg); border-left: 4px solid #89b4fa; color: #cdd6f4; }
+    #updateMsg.show { display: block; }
+    #updateMsg.error { border-left-color: var(--error); background: rgba(255, 99, 71, 0.12); color: #ffb4a6; }
+    #updateMsg.ok { border-left-color: #228B22; background: rgba(34, 139, 34, 0.15); color: #b6f0b6; }
+    #updateBtn { background: var(--panel-bg); color: #cdd6f4; white-space: nowrap; }
+    #updateBtn.ready { background: #228B22; color: white; animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(34,139,34,0.35); } }
+
+    .tabs { display: flex; gap: 8px; margin-bottom: 15px; align-items: center; }
+    .tab { background: var(--panel-bg); color: #a6adc8; }
+    .tab.active { background: var(--accent); color: white; }
+    #page-convert { flex: 1; flex-direction: column; min-height: 0; }
+
     .keyword { color: #569CD6; font-weight: bold; }
+    .comment { color: #6A9955; }
   </style>
 </head>
 <body>
 
   <div class="sidebar">
-    <div style="text-align: center;">
-      <img src="super-cashier.png" style="width: 140px; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.5);">
-      <h1 style="margin-top: 20px; font-size: 26px;">Compare Databases</h1>
+    <div class="brand">
+      <img src="super-cashier.png">
+      <div>
+        <h1>Compare Databases</h1>
+        <div class="powered">Powered by Super Cashier</div>
+      </div>
     </div>
-    
-    <div class="form-group">
-      <input type="text" id="host" placeholder="Host (e.g. 127.0.0.1)" value="127.0.0.1">
-    </div>
-    <div class="form-group">
-      <input type="text" id="user" placeholder="Username" value="root">
-    </div>
-    <div class="form-group">
-      <input type="password" id="pass" placeholder="Password">
-    </div>
-    
-    <button id="connectBtn" style="width: 100%">Connect to MySQL</button>
-    <div class="status" id="status">Not Connected</div>
+
+    <div class="conn" id="conn-source"></div>
+    <div class="conn" id="conn-target"></div>
   </div>
 
   <div class="main">
+    <div class="tabs">
+      <button class="tab active" data-page="compare">⇄ Compare</button>
+      <button class="tab" data-page="convert">MySQL → PostgreSQL</button>
+      <div class="update">
+        <span id="appVersion"></span>
+        <button id="updateBtn">⟳ Check for updates</button>
+      </div>
+    </div>
+    <div id="updateMsg"></div>
+
+    <div class="page" id="page-convert" style="display: none;">
+      <div class="topbar">
+        <div>
+          <label>MySQL DB:</label>
+          <select id="convSourceCb" disabled><option>Connect a MySQL source...</option></select>
+        </div>
+        <div>
+          <label>PostgreSQL DB:</label>
+          <select id="convTargetMode" style="width: auto; flex-shrink: 0;">
+            <option value="new">New</option>
+            <option value="existing">Existing (replace data)</option>
+          </select>
+          <input type="text" id="convNewDb" placeholder="New database name, e.g. shop_pg">
+          <select id="convExistingDb" style="display: none;"><option>Connect a PostgreSQL target...</option></select>
+        </div>
+      </div>
+      <div class="mode" id="convMode"></div>
+      <div class="action-bar">
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <button id="convPreviewBtn" disabled>👁 Preview PostgreSQL SQL</button>
+          <button class="btn-green" id="convCreateBtn" disabled>▶ Create in PostgreSQL</button>
+          <label style="display: flex; gap: 6px; align-items: center; font-size: 14px; white-space: nowrap;">
+            <input type="checkbox" id="convCopyData" checked style="width: auto;"> Copy data too
+          </label>
+        </div>
+        <button id="convCopyBtn" disabled>📋 Copy SQL</button>
+      </div>
+      <div class="editor" id="convEditor"></div>
+    </div>
+
+    <div class="page" id="page-compare" style="display: contents;">
     <div class="topbar">
       <div>
         <label>Source DB:</label>
@@ -70,101 +139,408 @@
         <select id="targetCb" disabled><option>Connect first...</option></select>
       </div>
     </div>
+    <div class="mode" id="mode"></div>
 
     <div class="action-bar">
       <button class="btn-green" id="compareBtn" disabled>▶ Compare Databases</button>
-      <button id="copyBtn" disabled>📋 Copy SQL</button>
+      <div style="display: flex; gap: 10px;">
+        <button id="runBtn" disabled>⚡ Run on target</button>
+        <button id="copyBtn" disabled>📋 Copy SQL</button>
+      </div>
     </div>
 
     <div class="editor" id="editor"></div>
+    </div>
   </div>
 
   <script>
     const { ipcRenderer } = require('electron');
 
-    const connectBtn = document.getElementById('connectBtn');
     const compareBtn = document.getElementById('compareBtn');
     const copyBtn = document.getElementById('copyBtn');
-    const sourceCb = document.getElementById('sourceCb');
-    const targetCb = document.getElementById('targetCb');
-    const statusEl = document.getElementById('status');
     const editorEl = document.getElementById('editor');
+    const modeEl = document.getElementById('mode');
+    const selects = { source: document.getElementById('sourceCb'), target: document.getElementById('targetCb') };
+
+    const defaults = {
+      mysql: { port: '3306', user: 'root', label: 'MySQL' },
+      postgres: { port: '5432', user: 'postgres', label: 'PostgreSQL' }
+    };
+    const connected = { source: null, target: null };
 
     let currentSQL = "";
 
-    function syntaxHighlight(sql) {
-      const keywords = ['CREATE TABLE', 'ALTER TABLE', 'ADD COLUMN', 'MODIFY COLUMN', 'NOT NULL', 'DEFAULT', 'PRIMARY KEY', 'FOREIGN KEY', 'REFERENCES', 'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'ON', 'AND', 'OR', 'IS', 'NULL', 'INT', 'VARCHAR', 'TEXT', 'DATETIME', 'BOOLEAN'];
-      let highlighted = sql.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      keywords.forEach(kw => {
-        const regex = new RegExp(`\\b${kw}\\b`, 'gi');
-        highlighted = highlighted.replace(regex, `<span class="keyword">${kw}</span>`);
-      });
-      return highlighted;
+    // Native dialog from the main process. The browser's alert()/confirm() leave inputs
+    // unable to take typing on Windows until the window is refocused.
+    // Returns the index of the clicked button.
+    function showDialog(message, type = 'error', buttons = ['OK']) {
+      return ipcRenderer.invoke('show-dialog', { message, type, buttons });
     }
 
-    connectBtn.addEventListener('click', async () => {
+    function syntaxHighlight(sql) {
+      const keywords = ['CREATE TABLE', 'ALTER TABLE', 'ADD COLUMN', 'DROP COLUMN', 'DROP TABLE', 'ADD CONSTRAINT', 'DROP CONSTRAINT', 'DROP FOREIGN KEY', 'CREATE SEQUENCE', 'CREATE TYPE', 'CREATE INDEX', 'BEGIN', 'COMMIT', 'MODIFY COLUMN', 'NOT NULL', 'DEFAULT', 'PRIMARY KEY', 'FOREIGN KEY', 'REFERENCES', 'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'ON', 'AND', 'OR', 'IS', 'NULL', 'INT', 'VARCHAR', 'TEXT', 'DATETIME', 'BOOLEAN'];
+      return sql.split('\n').map(line => {
+        let html = line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        if (/^\s*--/.test(line)) return `<span class="comment">${html}</span>`;
+        keywords.forEach(kw => {
+          const regex = new RegExp(`\\b${kw}\\b`, 'gi');
+          html = html.replace(regex, `<span class="keyword">${kw}</span>`);
+        });
+        return html;
+      }).join('\n');
+    }
+
+    function renderConn(side) {
+      const title = side === 'source' ? 'Source server' : 'Target server';
+      const copy = side === 'target' ? `<button type="button" data-f="copy">Same as source</button>` : '';
+      const el = document.getElementById(`conn-${side}`);
+      el.innerHTML = `
+        <div class="conn-head"><h2>${title}</h2>${copy}</div>
+        <div class="form-group">
+          <select data-f="type">
+            <option value="mysql">MySQL</option>
+            <option value="postgres">PostgreSQL</option>
+          </select>
+        </div>
+        <div class="form-group row">
+          <input type="text" data-f="host" placeholder="Host (e.g. 127.0.0.1)" value="127.0.0.1" style="flex: 3;">
+          <input type="number" data-f="port" placeholder="Port" value="3306" style="flex: 1.4;">
+        </div>
+        <div class="form-group row">
+          <input type="text" data-f="user" placeholder="Username" value="root">
+          <input type="password" data-f="password" placeholder="Password">
+        </div>
+        <div class="form-group row pg-only" style="display: none;">
+          <input type="text" data-f="database" placeholder="Login DB" value="postgres" title="Database used to log in (default: postgres)">
+          <input type="text" data-f="schema" placeholder="Schema" value="public" title="Schema to compare (default: public)">
+        </div>
+        <button class="connect" data-f="connect">Connect to MySQL</button>
+        <div class="status" data-f="status">Not Connected</div>`;
+
+      const f = name => el.querySelector(`[data-f="${name}"]`);
+
+      f('type').addEventListener('change', () => applyType(el));
+      f('connect').addEventListener('click', () => connect(side));
+      if (side === 'target') {
+        f('copy').addEventListener('click', () => {
+          const src = document.getElementById('conn-source');
+          ['type', 'host', 'port', 'user', 'password', 'database', 'schema'].forEach(name => {
+            f(name).value = src.querySelector(`[data-f="${name}"]`).value;
+          });
+          applyType(el);
+          connect('target');
+        });
+      }
+    }
+
+    function applyType(el) {
+      const f = name => el.querySelector(`[data-f="${name}"]`);
+      const type = f('type').value;
+      const other = defaults[type === 'mysql' ? 'postgres' : 'mysql'];
+      if (!f('port').value || f('port').value === other.port) f('port').value = defaults[type].port;
+      if (!f('user').value || f('user').value === other.user) f('user').value = defaults[type].user;
+      el.querySelectorAll('.pg-only').forEach(x => x.style.display = type === 'postgres' ? '' : 'none');
+      f('connect').textContent = `Connect to ${defaults[type].label}`;
+    }
+
+    async function connect(side) {
+      const el = document.getElementById(`conn-${side}`);
+      const f = name => el.querySelector(`[data-f="${name}"]`);
+      const statusEl = f('status');
+      const select = selects[side];
+      const type = f('type').value;
+
       statusEl.textContent = "Connecting...";
       statusEl.style.color = "#a6adc8";
-      
-      const host = document.getElementById('host').value;
-      const user = document.getElementById('user').value;
-      const password = document.getElementById('pass').value;
+      connected[side] = null;
+      select.disabled = true;
+      updateMode();
 
-      const res = await ipcRenderer.invoke('connect-db', { host, user, password });
-      
-      if(res.success) {
+      const res = await ipcRenderer.invoke('connect-db', {
+        side,
+        type,
+        host: f('host').value,
+        port: Number(f('port').value) || Number(defaults[type].port),
+        user: f('user').value,
+        password: f('password').value,
+        database: f('database').value.trim() || 'postgres',
+        schema: f('schema').value.trim() || 'public'
+      });
+
+      if (res.success) {
         statusEl.textContent = "✅ Connected";
         statusEl.style.color = "var(--success)";
-        
-        sourceCb.innerHTML = '';
-        targetCb.innerHTML = '';
+        select.innerHTML = '';
         res.dbs.forEach(db => {
-          sourceCb.innerHTML += `<option value="${db}">${db}</option>`;
-          targetCb.innerHTML += `<option value="${db}">${db}</option>`;
+          select.innerHTML += `<option value="${db}">${db}</option>`;
         });
-        
-        sourceCb.disabled = false;
-        targetCb.disabled = false;
-        compareBtn.disabled = false;
+        select.disabled = false;
+        connected[side] = type;
+        if (side === 'source') convSourceCb.innerHTML = select.innerHTML;
+        if (side === 'target') convExistingDb.innerHTML = select.innerHTML;
       } else {
-        statusEl.textContent = "❌ Connection Failed";
+        // Shown in place (no popup): the error stays readable and the inputs stay editable
+        statusEl.textContent = "❌ " + res.error;
         statusEl.style.color = "var(--error)";
-        alert(res.error);
+      }
+      updateMode();
+    }
+
+    function updateMode() {
+      const { source, target } = connected;
+      compareBtn.disabled = !(source && target);
+      if (!source || !target) {
+        modeEl.textContent = "Connect the source and target servers.";
+      } else if (source === target) {
+        modeEl.textContent = `${defaults[source].label} → ${defaults[target].label}: SQL will make the target match the source.`;
+      } else if (source === 'mysql' && target === 'postgres') {
+        modeEl.textContent = "MySQL → PostgreSQL: the MySQL schema is converted to PostgreSQL style, then compared with the target.";
+      } else {
+        modeEl.textContent = "PostgreSQL → MySQL conversion is not supported yet.";
+        compareBtn.disabled = true;
+      }
+
+      const canConvert = source === 'mysql' && target === 'postgres';
+      convSourceCb.disabled = source !== 'mysql';
+      convPreviewBtn.disabled = !canConvert;
+      convCreateBtn.disabled = !canConvert;
+      convModeEl.textContent = canConvert
+        ? "Pick a MySQL database and a name for the new PostgreSQL database, then preview or create it."
+        : "Connect a MySQL server as Source and a PostgreSQL server as Target (left side).";
+    }
+
+    // ------------------------------------------------ MySQL -> PostgreSQL page
+
+    const convSourceCb = document.getElementById('convSourceCb');
+    const convNewDb = document.getElementById('convNewDb');
+    const convPreviewBtn = document.getElementById('convPreviewBtn');
+    const convCreateBtn = document.getElementById('convCreateBtn');
+    const convCopyBtn = document.getElementById('convCopyBtn');
+    const convEditorEl = document.getElementById('convEditor');
+    const convModeEl = document.getElementById('convMode');
+    let convSQL = "";
+
+    function showPage(page) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.page === page));
+      document.getElementById('page-compare').style.display = page === 'compare' ? 'contents' : 'none';
+      document.getElementById('page-convert').style.display = page === 'convert' ? 'flex' : 'none';
+    }
+    document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => showPage(t.dataset.page)));
+
+    // Suggest a name for the new database from the MySQL one
+    convSourceCb.addEventListener('change', () => {
+      if (!convNewDb.dataset.touched) convNewDb.value = convSourceCb.value + '_pg';
+    });
+    convNewDb.addEventListener('input', () => convNewDb.dataset.touched = '1');
+
+    const convTargetMode = document.getElementById('convTargetMode');
+    const convExistingDb = document.getElementById('convExistingDb');
+    convTargetMode.addEventListener('change', () => {
+      const existing = convTargetMode.value === 'existing';
+      convNewDb.style.display = existing ? 'none' : '';
+      convExistingDb.style.display = existing ? '' : 'none';
+      convCreateBtn.textContent = existing ? '▶ Replace data in PostgreSQL' : '▶ Create in PostgreSQL';
+    });
+
+    convPreviewBtn.addEventListener('click', async () => {
+      convEditorEl.innerHTML = "Converting...";
+      const res = await ipcRenderer.invoke('convert-preview', { source: convSourceCb.value });
+      if (res.success) {
+        convSQL = res.sql.trim();
+        convEditorEl.innerHTML = convSQL ? syntaxHighlight(convSQL) : "This MySQL database has no tables.";
+        convCopyBtn.disabled = !convSQL;
+        convModeEl.textContent = "✅ This is the PostgreSQL version of the MySQL schema. Lines starting with -- NOTE need your attention.";
+      } else {
+        convEditorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
       }
     });
 
-    compareBtn.addEventListener('click', async () => {
-      const source = sourceCb.value;
-      const target = targetCb.value;
-      
-      if(source === target) {
-        alert("Source and Target cannot be the same.");
+    ipcRenderer.on('convert-progress', (event, msg) => {
+      convModeEl.textContent = '⏳ ' + msg;
+    });
+
+    convCreateBtn.addEventListener('click', async () => {
+      const source = convSourceCb.value;
+      const existing = convTargetMode.value === 'existing';
+      const newDb = existing ? convExistingDb.value : convNewDb.value.trim();
+      if (!newDb) {
+        showDialog("Enter a name for the new PostgreSQL database.", 'warning');
         return;
       }
-      
+      const copyData = document.getElementById('convCopyData').checked;
+      if (existing && await showDialog(
+        `Replace the data in PostgreSQL "${newDb}" with the data from MySQL "${source}"?\n\n` +
+        `• Every table that also exists in MySQL is EMPTIED and filled with the MySQL data.\n` +
+        `• Your PostgreSQL table structure is kept; values are converted to fit it.\n` +
+        `• Tables that only exist in MySQL are created.\n` +
+        `• If anything fails, nothing is changed.\n\n` +
+        `The current data in those PostgreSQL tables will be deleted.`,
+        'warning', ['Replace data', 'Cancel']) !== 0) return;
+      convPreviewBtn.disabled = convCreateBtn.disabled = true;
+      convEditorEl.innerHTML = "";
+
+      const res = await ipcRenderer.invoke('convert-create', { source, newDb, existing, copyData });
+      convPreviewBtn.disabled = convCreateBtn.disabled = false;
+
+      if (!res.success) {
+        convModeEl.textContent = existing
+          ? `❌ Failed. "${newDb}" was rolled back and is unchanged.`
+          : "❌ Failed. Nothing was created.";
+        convEditorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
+        return;
+      }
+
+      // Refresh the target list and compare the two databases right away
+      selects.target.innerHTML = '';
+      res.dbs.forEach(db => {
+        selects.target.innerHTML += `<option value="${db}">${db}</option>`;
+      });
+      selects.source.value = source;
+      selects.target.value = newDb;
+
+      const notes = res.warnings.length ? '\n\n' + res.warnings.map(w => '-- WARNING: ' + w).join('\n') : '';
+      const what = existing
+        ? `Replaced the data of ${res.replacedCount} table(s) and created ${res.createdCount} new table(s) in PostgreSQL "${newDb}" from MySQL "${source}"`
+        : `Created PostgreSQL database "${newDb}" from MySQL "${source}"`;
+      convEditorEl.innerHTML = syntaxHighlight(`-- ✅ ${what}` +
+        (copyData ? ' with its data.' : ' (structure only).') + notes);
+      convExistingDb.innerHTML = selects.target.innerHTML;
+      convExistingDb.value = newDb;
+      convModeEl.textContent = `✅ Done. Opening Compare: ${source} (MySQL) → ${newDb} (PostgreSQL)...`;
+
+      showPage('compare');
+      compareBtn.click();
+    });
+
+    renderConn('source');
+    renderConn('target');
+    updateMode();
+
+    compareBtn.addEventListener('click', async () => {
+      const source = selects.source.value;
+      const target = selects.target.value;
+      const sameServer = JSON.stringify(connected.source) === JSON.stringify(connected.target) &&
+        ['host', 'port'].every(name =>
+          document.querySelector(`#conn-source [data-f="${name}"]`).value ===
+          document.querySelector(`#conn-target [data-f="${name}"]`).value);
+
+      if (sameServer && source === target) {
+        showDialog("Source and Target cannot be the same.", 'warning');
+        return;
+      }
+
       editorEl.innerHTML = "Generating...";
+      runBtn.disabled = true;
       const res = await ipcRenderer.invoke('compare-db', { source, target });
-      
-      if(res.success) {
+
+      if (res.success) {
         currentSQL = res.sql.trim();
-        if(currentSQL) {
+        runBtn.disabled = !currentSQL;
+        if (currentSQL) {
           editorEl.innerHTML = syntaxHighlight(currentSQL);
           copyBtn.disabled = false;
-          statusEl.textContent = "✅ Sync Script Generated";
+          modeEl.textContent = "✅ Sync script generated. Run it on the target database.";
         } else {
           editorEl.innerHTML = "";
           copyBtn.disabled = true;
-          statusEl.textContent = "✅ Databases are identical";
+          modeEl.textContent = "✅ Databases are identical";
         }
       } else {
         editorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
       }
     });
 
+    const runBtn = document.getElementById('runBtn');
+    runBtn.addEventListener('click', async () => {
+      if (!currentSQL) return;
+      const target = selects.target.value;
+      const drops = (currentSQL.match(/^(DROP TABLE|ALTER TABLE \S+ DROP COLUMN)/gm) || []).length;
+      const warning = drops ? `\n\n⚠ It DROPS ${drops} table(s)/column(s). Their data will be deleted.` : '';
+      if (await showDialog(`Run this SQL on target database "${target}"?${warning}`, 'warning', ['Run', 'Cancel']) !== 0) return;
+
+      runBtn.disabled = true;
+      modeEl.textContent = "⏳ Running on target...";
+      const res = await ipcRenderer.invoke('run-sql', { target, sql: currentSQL });
+      if (res.success) {
+        modeEl.textContent = "✅ Applied. Comparing again...";
+        compareBtn.click();
+      } else {
+        runBtn.disabled = false;
+        modeEl.textContent = "❌ Failed. Nothing was changed on PostgreSQL (the script is rolled back).";
+        if (connected.target === 'mysql') modeEl.textContent = "❌ Failed. MySQL applied the statements before the failing one.";
+        showDialog("Error: " + res.error);
+      }
+    });
+
+    // ------------------------------------------------ Self update
+
+    const updateBtn = document.getElementById('updateBtn');
+    const updateMsg = document.getElementById('updateMsg');
+    let updateAction = 'check';
+    let manualCheck = false;
+
+    ipcRenderer.invoke('app-version').then(v => document.getElementById('appVersion').textContent = `Version ${v}`);
+
+    function setUpdateButton(action, label, disabled = false) {
+      updateAction = action;
+      updateBtn.textContent = label;
+      updateBtn.disabled = disabled;
+      updateBtn.classList.toggle('ready', action === 'download' || action === 'install');
+    }
+
+    // kind: 'info', 'ok' or 'error'; an empty text hides the bar
+    function showUpdateMsg(text, kind = 'info') {
+      updateMsg.textContent = text;
+      updateMsg.className = text ? `show ${kind}` : '';
+    }
+
+    ipcRenderer.on('update-status', (event, s) => {
+      if (s.state === 'checking') {
+        setUpdateButton('check', 'Checking...', true);
+      } else if (s.state === 'available') {
+        setUpdateButton('download', `⬇ Download v${s.version}`);
+        showUpdateMsg(`🎉 New version ${s.version} is available. Click "Download" to get it.`, 'ok');
+      } else if (s.state === 'latest') {
+        setUpdateButton('check', '⟳ Check for updates');
+        if (manualCheck) showUpdateMsg("✅ You have the latest version.", 'ok');
+      } else if (s.state === 'downloading') {
+        setUpdateButton('download', `Downloading ${s.percent}%`, true);
+        showUpdateMsg("⬇ Downloading the update...");
+      } else if (s.state === 'ready') {
+        setUpdateButton('install', `🔄 Restart & install v${s.version}`);
+        showUpdateMsg("✅ Update downloaded. Click \"Restart & install\" to finish.", 'ok');
+      } else if (s.state === 'error') {
+        setUpdateButton('check', '⟳ Check for updates');
+        // The startup check stays quiet (e.g. when offline); only report errors the user asked for
+        if (manualCheck) showUpdateMsg("❌ Update failed: " + s.message, 'error');
+      }
+    });
+
+    updateBtn.addEventListener('click', async () => {
+      manualCheck = true;
+      if (updateAction === 'install') {
+        ipcRenderer.invoke('update-install');
+        return;
+      }
+      showUpdateMsg("");
+      const res = await ipcRenderer.invoke(updateAction === 'download' ? 'update-download' : 'update-check');
+      if (!res.success) {
+        setUpdateButton('check', '⟳ Check for updates');
+        showUpdateMsg("❌ " + res.error, 'error');
+      }
+    });
+
+    convCopyBtn.addEventListener('click', async () => {
+      if (convSQL) {
+        await ipcRenderer.invoke('copy-to-clipboard', convSQL);
+        convModeEl.textContent = "✅ Copied to clipboard";
+      }
+    });
+
     copyBtn.addEventListener('click', async () => {
-      if(currentSQL) {
+      if (currentSQL) {
         await ipcRenderer.invoke('copy-to-clipboard', currentSQL);
-        statusEl.textContent = "✅ Copied to clipboard";
+        modeEl.textContent = "✅ Copied to clipboard";
       }
     });
   </script>

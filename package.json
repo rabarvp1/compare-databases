@@ -5,23 +5,34 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win"
+    "build": "electron-builder --win",
+    "release": "electron-builder --win --publish always"
   },
   "build": {
     "appId": "com.rabar.comparedatabases",
     "productName": "Compare Databases",
+    "electronDist": "node_modules/electron/dist",
+    "publish": {
+      "provider": "github",
+      "owner": "rabarvp1",
+      "repo": "compare-databases-releases",
+      "releaseType": "release"
+    },
     "win": {
       "target": "nsis",
       "icon": "super-cashier.ico"
     },
     "nsis": {
+      "artifactName": "Compare-Databases-Setup-${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": true
     }
   },
   "dependencies": {
-    "mysql2": "^3.9.0"
+    "electron-updater": "^6.8.11",
+    "mysql2": "^3.9.0",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "electron": "^30.0.1",
