@@ -406,8 +406,14 @@
         (copyData ? ' with its data.' : ' (structure only).') + notes);
       convExistingDb.innerHTML = selects.target.innerHTML;
       convExistingDb.value = newDb;
+      // Replace data keeps the PostgreSQL structure on purpose, so a compare would list its
+      // structural differences from MySQL (even DROP TABLE for PostgreSQL-only tables).
+      // Only a new database is expected to match exactly, so only then compare right away.
+      if (existing) {
+        convModeEl.textContent = `✅ Done. The data in "${newDb}" now comes from MySQL "${source}"; its PostgreSQL structure was kept.`;
+        return;
+      }
       convModeEl.textContent = `✅ Done. Opening Compare: ${source} (MySQL) → ${newDb} (PostgreSQL)...`;
-
       showPage('compare');
       compareBtn.click();
     });

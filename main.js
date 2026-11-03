@@ -107,6 +107,92 @@ function groupConstraints(rows) {
   return [...groups.values()];
 }
 
+// ---------------------------------------------------------------- Canonical forms
+// The same definition can be printed in different ways ('0'::numeric vs 0.00000000,
+// varchar vs character varying, IN (...) vs = ANY (ARRAY[...])). Comparing canonical
+// forms keeps the compare from reporting differences that are not real.
+
+// Numbers as their plain value: 0.00000000 -> 0, 010.50 -> 10.5
+function canonNumber(s) {
+  let [int, frac = ''] = String(s).replace(/^\+/, '').split('.');
+  const neg = int.startsWith('-');
+  int = int.replace(/^-/, '').replace(/^0+(?=\d)/, '');
+  frac = frac.replace(/0+$/, '');
+  const out = (neg ? '-' : '') + int + (frac ? '.' + frac : '');
+  return out === '-0' ? '0' : out;
+}
+
+// A cast such as ::text, ::character varying, ::numeric(12,2) or ::text[]
+const PG_CAST = /::\s*(?:character varying|double precision|bit varying|(?:timestamp|time)(?:\(\d+\))?\s+with(?:out)?\s+time\s+zone|"[^"]+"|[a-z_][a-z0-9_]*)(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])?/gi;
+
+const PG_TYPE_ALIASES = [
+  [/^varchar\b/, 'character varying'],
+  [/^char\b/, 'character'],
+  [/^(int|int4)$/, 'integer'],
+  [/^int8$/, 'bigint'],
+  [/^int2$/, 'smallint'],
+  [/^bool$/, 'boolean'],
+  [/^float8$/, 'double precision'],
+  [/^float4$/, 'real'],
+  [/^decimal\b/, 'numeric'],
+  [/^timestamptz$/, 'timestamp with time zone'],
+  [/^(timestamp|time)(\(\d+\))?$/, '$1$2 without time zone']
+];
+
+function pgCanonType(type) {
+  let t = String(type).toLowerCase().replace(/\s+/g, ' ').trim();
+  for (const [re, to] of PG_TYPE_ALIASES) t = t.replace(re, to);
+  // No precision on timestamp/time means 6
+  return t.replace(/^(timestamp|time) (with|without) time zone$/, '$1(6) $2 time zone');
+}
+
+// Wraps in parentheses only when they enclose the whole expression
+function stripOuterParens(s) {
+  while (s.startsWith('(') && s.endsWith(')')) {
+    let depth = 0, wraps = true;
+    for (let i = 0; i < s.length - 1; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') depth--;
+      if (depth === 0) { wraps = false; break; }
+    }
+    if (!wraps) break;
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+// Shared by both engines once the raw default text is known
+function canonDefaultText(def) {
+  if (def === null || def === undefined) return '';
+  const d = stripOuterParens(String(def).trim());
+  if (/^(now\(\)|current_timestamp(\(\d*\))?|localtimestamp(\(\d*\))?|transaction_timestamp\(\))$/i.test(d)) return 'NOW';
+  const lit = /^'((?:[^']|'')*)'$/.exec(d);
+  const value = lit ? lit[1].replace(/''/g, "'") : d;
+  if (/^[-+]?\d+(\.\d+)?$/.test(value)) return canonNumber(value);
+  if (/^(true|false)$/i.test(value)) return value.toLowerCase();
+  return (lit ? 'S:' : 'E:') + value;
+}
+
+function pgCanonDefault(c) {
+  // serial (nextval) and identity columns both just mean "auto increment"
+  if (c.identity || /^nextval\(/i.test(c.def || '')) return 'AUTO';
+  return canonDefaultText(c.def == null ? null : String(c.def).replace(PG_CAST, ''));
+}
+
+// CHECK (type IN ('a','b')) and CHECK (((type)::text = ANY ((ARRAY['a'::character varying, ...])::text[])))
+// are the same check
+function pgCanonCheck(def) {
+  return def.replace(PG_CAST, '').replace(/["\s()]/g, '').replace(/=ANYARRAY\[(.*?)\]/g, 'IN$1');
+}
+
+// Columns of a foreign key on both sides, from its definition (works for both engines)
+function fkParts(fk) {
+  const m = /FOREIGN KEY\s*\((.+?)\)\s*REFERENCES\s+(.+?)\s*\((.+?)\)/i.exec(fk.def);
+  if (!m) return null;
+  const names = s => s.split(',').map(x => x.trim().replace(/^["`]|["`]$/g, ''));
+  return { columns: names(m[1]), refTable: names(m[2]).pop(), refColumns: names(m[3]) };
+}
+
 // ---------------------------------------------------------------- MySQL
 
 const mysqlDriver = {
@@ -156,7 +242,7 @@ const mysqlDriver = {
     `, [db]);
     const [indexRows] = await session.conn.query(`
       SELECT TABLE_NAME AS tbl, INDEX_NAME AS name, NON_UNIQUE AS nonUnique, COLUMN_NAME AS col,
-             INDEX_TYPE AS type
+             INDEX_TYPE AS type, SUB_PART AS subPart
       FROM information_schema.STATISTICS
       WHERE TABLE_SCHEMA = ?
       ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
@@ -170,7 +256,8 @@ const mysqlDriver = {
         name: ix.name,
         unique: Number(ix.rows[0].nonUnique) === 0,
         type: ix.rows[0].type,
-        columns: ix.rows.map(r => r.col)
+        columns: ix.rows.map(r => r.col),
+        subParts: ix.rows.map(r => r.subPart)
       });
     }
     schema.fks = groupConstraints(fkRows).map(fk => {
@@ -204,19 +291,54 @@ const mysqlDriver = {
     }
 
     sql += c.nullable === 'NO' ? ' NOT NULL' : ' NULL';
-    if (c.def !== null) {
-      if (/^current_timestamp/i.test(c.def) || /^b'[01]*'$/.test(c.def)) {
-        sql += ` DEFAULT ${c.def}`;
-      } else if (/DEFAULT_GENERATED/i.test(c.extra || '')) {
-        sql += ` DEFAULT (${unescape(c.def)})`;
-      } else {
-        sql += ` DEFAULT '${c.def.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
-      }
-    }
+    if (c.def !== null) sql += ` DEFAULT ${this.defaultSql(c)}`;
     const extra = (c.extra || '').replace(/DEFAULT_GENERATED/i, '').trim();
     if (extra) sql += ' ' + extra.toUpperCase();
     return sql;
   },
+
+  // The DEFAULT value of a column as SQL
+  defaultSql(c) {
+    if (/^current_timestamp/i.test(c.def) || /^b'[01]*'$/.test(c.def)) return c.def;
+    if (/DEFAULT_GENERATED/i.test(c.extra || '')) return `(${c.def.replace(/\\'/g, "'")})`;
+    return `'${c.def.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
+  },
+
+  // Everything about a column that matters when comparing; display widths like int(11) are ignored
+  columnSig(c) {
+    const type = c.type.toLowerCase().replace(/^integer\b/, 'int')
+      .replace(/^(tinyint|smallint|mediumint|int|bigint)\(\d+\)/, (m, base) => (m === 'tinyint(1)' ? m : base));
+    const extra = (c.extra || '').toLowerCase().replace('default_generated', '').replace(/\s+/g, ' ').trim();
+    return [type, c.nullable, canonDefaultText(c.def), extra, c.generation || ''].join('|');
+  },
+
+  alterColumn(table, s) {
+    const out = [];
+    // Rows with NULL would block NOT NULL, so give them the default first
+    if (s.nullable === 'NO' && s.def !== null && !/GENERATED/i.test(s.extra || '')) {
+      out.push(`UPDATE ${this.q(table)} SET ${this.q(s.name)} = ${this.defaultSql(s)} WHERE ${this.q(s.name)} IS NULL;`);
+    }
+    out.push(`ALTER TABLE ${this.q(table)} MODIFY COLUMN ${this.columnSql(s)};`);
+    return out;
+  },
+
+  // Indexes of one table in canonical form; the primary key is left alone
+  indexItems(table, t) {
+    return (t.indexes || []).filter(ix => ix.name !== 'PRIMARY').map(ix => {
+      const kind = ix.type === 'FULLTEXT' ? 'FULLTEXT ' : ix.type === 'SPATIAL' ? 'SPATIAL ' : ix.unique ? 'UNIQUE ' : '';
+      const part = i => (ix.subParts?.[i] ? `(${ix.subParts[i]})` : '');
+      return {
+        name: ix.name,
+        columns: ix.columns,
+        canon: kind + '(' + ix.columns.map((c, i) => c + part(i)).join(',') + ')',
+        add: `ALTER TABLE ${this.q(table)} ADD ${kind}INDEX ${this.q(ix.name)} (${ix.columns.map((c, i) => this.q(c) + part(i)).join(', ')});`,
+        drop: `ALTER TABLE ${this.q(table)} DROP INDEX ${this.q(ix.name)};`
+      };
+    });
+  },
+
+  // MySQL refuses to drop the only index a foreign key uses
+  needsIndexForFks: true,
 
   // Foreign keys are stripped here and added later, so table order does not matter
   async createTable(session, schema, table) {
@@ -252,6 +374,14 @@ const mysqlDriver = {
 };
 
 // ---------------------------------------------------------------- PostgreSQL
+
+// USING expression for ALTER COLUMN ... TYPE; 0/1 numbers and booleans need explicit rules
+function pgUsing(col, from, to, toSpelled) {
+  const isNumber = t => /^(smallint|integer|bigint|numeric)/.test(t);
+  if (to === 'boolean' && isNumber(from)) return `(${col} <> 0)`;
+  if (from === 'boolean' && isNumber(to)) return `(${col})::integer::${toSpelled}`;
+  return `${col}::${toSpelled}`;
+}
 
 const postgresDriver = {
   q: n => '"' + String(n).replace(/"/g, '""') + '"',
@@ -396,16 +526,89 @@ const postgresDriver = {
     return statements.join('\n\n');
   },
 
+  // Checks and unique keys for the new column are added by the index/constraint step
   addColumn(schema, table, column) {
-    const t = schema.tables[table];
-    // A converted CHECK (from a MySQL enum) belongs with its new column
-    const checks = (t.constraints || [])
-      .filter(con => con.column === column.name)
-      .map(con => `ALTER TABLE ${this.q(table)} ADD CONSTRAINT ${this.q(con.name)} ${con.def};`);
     return this.wrapSequence(table, column, [
-      this.notesSql(column.notes) + `ALTER TABLE ${this.q(table)} ADD COLUMN ${this.columnSql(column)};`,
-      ...checks
+      this.notesSql(column.notes) + `ALTER TABLE ${this.q(table)} ADD COLUMN ${this.columnSql(column)};`
     ]).join('\n\n');
+  },
+
+  columnSig(c) {
+    const def = c.generated ? 'G:' + String(c.def).replace(/\s+/g, '') : pgCanonDefault(c);
+    return [pgCanonType(c.type), c.notnull ? 'NOT NULL' : 'NULL', def].join('|');
+  },
+
+  // Turns column t (target) into column s (source). Order matters: identity off before
+  // NOT NULL can be dropped, old default off before the type changes, NOT NULL before
+  // identity can be added.
+  alterColumn(table, s, t) {
+    const q = this.q;
+    const col = `ALTER TABLE ${q(table)} ALTER COLUMN ${q(s.name)}`;
+    if (s.generated || t.generated) {
+      return [`-- NOTE: ${table}.${s.name} is a generated column with a different definition; change it by hand.`];
+    }
+    const out = [];
+    const sType = pgCanonType(s.type), tType = pgCanonType(t.type);
+    const sDef = pgCanonDefault(s), tDef = pgCanonDefault(t);
+    let targetDefault = tDef;
+
+    if (tDef === 'AUTO' && sDef !== 'AUTO') {
+      out.push(t.identity ? `${col} DROP IDENTITY IF EXISTS;` : `${col} DROP DEFAULT;`);
+      targetDefault = '';
+    }
+    if (sType !== tType) {
+      if (targetDefault && targetDefault !== 'AUTO') {
+        out.push(`${col} DROP DEFAULT;`);
+        targetDefault = '';
+      }
+      out.push(`${col} TYPE ${s.type} USING ${pgUsing(q(s.name), tType, sType, s.type)};`);
+    }
+    if (s.notnull && !t.notnull) {
+      if (s.def != null && sDef !== 'AUTO') {
+        out.push(`UPDATE ${q(table)} SET ${q(s.name)} = ${s.def} WHERE ${q(s.name)} IS NULL;`);
+      }
+      out.push(`${col} SET NOT NULL;`);
+    } else if (!s.notnull && t.notnull) {
+      out.push(`${col} DROP NOT NULL;`);
+    }
+    if (sDef === 'AUTO' && targetDefault !== 'AUTO') {
+      if (targetDefault) out.push(`${col} DROP DEFAULT;`);
+      const tableLit = `'${q(table).replace(/'/g, "''")}'`;
+      out.push(`${col} ADD GENERATED BY DEFAULT AS IDENTITY;`);
+      out.push(`SELECT setval(pg_get_serial_sequence(${tableLit}, '${s.name.replace(/'/g, "''")}'), ` +
+               `COALESCE((SELECT MAX(${q(s.name)}) FROM ${q(table)}), 0) + 1, false);`);
+    } else if (sDef !== 'AUTO' && sDef !== targetDefault) {
+      out.push(s.def != null ? `${col} SET DEFAULT ${s.def};` : `${col} DROP DEFAULT;`);
+    }
+    return out;
+  },
+
+  // Unique keys, checks and plain indexes of one table in canonical form. A unique
+  // constraint and a unique index on the same columns count as the same thing.
+  indexItems(table, t) {
+    const q = this.q;
+    const items = [];
+    for (const con of t.constraints || []) {
+      if (con.type !== 'u' && con.type !== 'c') continue;
+      items.push({
+        name: con.name,
+        canon: con.type === 'u' ? 'U:' + con.def.replace(/^UNIQUE\s*/i, '').replace(/["\s]/g, '') : 'C:' + pgCanonCheck(con.def),
+        add: `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(con.name)} ${con.def};`,
+        drop: `ALTER TABLE ${q(table)} DROP CONSTRAINT ${q(con.name)};`
+      });
+    }
+    for (const def of t.indexes || []) {
+      const m = /^CREATE (UNIQUE )?INDEX (?:CONCURRENTLY )?(?:IF NOT EXISTS )?("(?:[^"]|"")+"|\S+) ON (?:ONLY )?(?:"(?:[^"]|"")+"|\S+)\s*(.*)$/i.exec(def);
+      if (!m) continue;
+      const rest = m[3].replace(/^USING btree\s*/i, '').replace(/["\s]/g, '');
+      items.push({
+        name: m[2].replace(/^"|"$/g, '').replace(/""/g, '"'),
+        canon: (m[1] ? 'U:' : 'I:') + rest,
+        add: def + ';',
+        drop: `DROP INDEX ${m[2]};`
+      });
+    }
+    return items;
   },
 
   dropColumn(table, column) {
@@ -499,8 +702,9 @@ function convertMysqlColumn(table, c) {
   let check = null;
   let kind = 'string';
 
-  const isBool = (base === 'tinyint' || base === 'bit') && args === '1';
-  if (isBool) { column.type = 'boolean'; kind = 'bool'; }
+  // tinyint(1) stays a 0/1 number (smallint), not boolean: apps written for MySQL compare
+  // these columns with 0/1, and boolean = integer is an error in PostgreSQL
+  if (base === 'bit' && args === '1') { column.type = 'boolean'; kind = 'bool'; }
   else if (base === 'tinyint') { column.type = 'smallint'; kind = 'number'; }
   else if (base === 'smallint') { column.type = unsigned ? 'integer' : 'smallint'; kind = 'number'; }
   else if (base === 'mediumint') { column.type = 'integer'; kind = 'number'; }
@@ -511,8 +715,9 @@ function convertMysqlColumn(table, c) {
   else if (base === 'double' || base === 'real') { column.type = 'double precision'; kind = 'number'; }
   else if (base === 'year') { column.type = 'smallint'; kind = 'number'; }
   else if (base === 'bit') { column.type = `bit(${args || 1})`; kind = 'bit'; }
-  else if (base === 'char') column.type = `char(${args || 1})`;
-  else if (base === 'varchar') column.type = `varchar(${args})`;
+  // Type names are spelled the way PostgreSQL prints them, so compares match exactly
+  else if (base === 'char') column.type = `character(${args || 1})`;
+  else if (base === 'varchar') column.type = `character varying(${args})`;
   else if (/text$/.test(base) || base === 'set') column.type = 'text';
   else if (/blob$/.test(base) || base === 'binary' || base === 'varbinary') { column.type = 'bytea'; kind = 'binary'; }
   else if (base === 'date') { column.type = 'date'; kind = 'date'; }
@@ -521,7 +726,7 @@ function convertMysqlColumn(table, c) {
   else if (base === 'json') column.type = 'json';
   else if (base === 'enum') {
     // Same approach Laravel uses on PostgreSQL: varchar + CHECK constraint
-    column.type = 'varchar(255)';
+    column.type = 'character varying(255)';
     check = { name: `${table}_${c.name}`.slice(0, PG_MAX_NAME - 6) + '_check', type: 'c', column: c.name,
               def: `CHECK (${postgresDriver.q(c.name)} IN (${args}))` };
   } else {
@@ -600,22 +805,70 @@ ipcMain.handle('compare-db', async (event, { source, target }) => {
   }
 });
 
-// Statements are ordered so every one of them runs against an existing object:
-// drop stale FKs -> create types/tables -> add columns -> add FKs -> drop columns -> drop tables
+// Statements are ordered so every one of them runs against objects in the right state:
+// drop stale FKs -> drop stale indexes/checks -> create types/tables -> add columns ->
+// change columns -> add indexes/checks -> add FKs -> drop columns -> drop tables
 async function buildSyncSql(d, srcSession, tgtSession, src, tgt) {
   const sections = [];
   const section = (title, statements) => {
     if (statements.length) sections.push(`-- ${title}\n\n${statements.join('\n\n')}`);
   };
-
-  // Quoting and spacing differ between how we write a definition and how the server prints it
-  const fkSig = fk => `${fk.table}\0${fk.name}\0${fk.def.replace(/[\s"`]/g, '')}`;
-  const srcFks = new Set(src.fks.map(fkSig));
-  const tgtFks = new Set(tgt.fks.map(fkSig));
   const sharedTables = Object.keys(src.tables).filter(t => tgt.tables[t]);
 
-  section('Drop foreign keys that are missing or different in source',
-    tgt.fks.filter(fk => !srcFks.has(fkSig(fk))).map(fk => d.dropForeignKey(fk)));
+  // Columns whose definition changed, as "table.column"
+  const changedCols = new Set();
+  const alterCols = [];
+  for (const t of sharedTables) {
+    const tgtCols = new Map(tgt.tables[t].columns.map(c => [c.name, c]));
+    for (const s of src.tables[t].columns) {
+      const c = tgtCols.get(s.name);
+      if (!c || d.columnSig(s) === d.columnSig(c)) continue;
+      changedCols.add(`${t}.${s.name}`);
+      alterCols.push(...d.alterColumn(t, s, c));
+    }
+  }
+
+  // Quoting and spacing differ between how we write a definition and how the server prints it.
+  // A key that touches a changed column is dropped and re-added around the change,
+  // because MySQL refuses to change the type of a column inside a foreign key.
+  const touchesChanged = fk => {
+    const p = fkParts(fk);
+    return p && (p.columns.some(c => changedCols.has(`${fk.table}.${c}`)) ||
+                 p.refColumns.some(c => changedCols.has(`${p.refTable}.${c}`)));
+  };
+  const fkSig = fk => `${fk.table}\0${fk.name}\0${fk.def.replace(/[\s"`]/g, '')}`;
+  const srcFks = new Set(src.fks.map(fkSig));
+  const keptFks = tgt.fks.filter(fk => srcFks.has(fkSig(fk)) && !touchesChanged(fk));
+  const keptSigs = new Set(keptFks.map(fkSig));
+
+  section('Drop foreign keys that are missing, different or on changed columns',
+    tgt.fks.filter(fk => !keptSigs.has(fkSig(fk))).map(fk => d.dropForeignKey(fk)));
+
+  // Unique keys, checks and indexes on tables both sides have
+  const dropIdx = [], addIdx = [];
+  for (const t of sharedTables) {
+    const want = d.indexItems(t, src.tables[t]);
+    const have = d.indexItems(t, tgt.tables[t]);
+    const wantCanon = new Set(want.map(i => i.canon));
+    const haveCanon = new Set(have.map(i => i.canon));
+    const dropping = have.filter(i => !wantCanon.has(i.canon));
+    for (const ix of dropping) {
+      // An index a remaining foreign key still needs can't go (MySQL); one with the same
+      // columns is usually created right after anyway
+      if (d.needsIndexForFks) {
+        const others = have.filter(o => o !== ix && !dropping.includes(o));
+        const needed = keptFks.filter(fk => fk.table === t).some(fk => {
+          const cols = fkParts(fk)?.columns || [];
+          const covers = i => cols.every((c, n) => i.columns?.[n] === c);
+          return covers(ix) && !others.some(covers);
+        });
+        if (needed) continue;
+      }
+      dropIdx.push(ix.drop);
+    }
+    addIdx.push(...want.filter(i => !haveCanon.has(i.canon)).map(i => i.add));
+  }
+  section('Drop indexes and constraints that are missing or different in source', dropIdx);
 
   if (d.createTypes) section('Create missing types', d.createTypes(src, tgt));
 
@@ -634,8 +887,12 @@ async function buildSyncSql(d, srcSession, tgtSession, src, tgt) {
   }
   section('Add missing columns', addCols);
 
+  section('Change columns (type, default, NULL / NOT NULL, auto increment)', alterCols);
+
+  section('Add missing indexes and constraints', addIdx);
+
   section('Add foreign keys',
-    src.fks.filter(fk => !tgtFks.has(fkSig(fk))).map(fk => d.addForeignKey(fk)));
+    src.fks.filter(fk => !keptSigs.has(fkSig(fk))).map(fk => d.addForeignKey(fk)));
 
   const dropCols = [];
   for (const t of sharedTables) {
