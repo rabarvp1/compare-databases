@@ -2,6 +2,8 @@
 <html>
 <head>
   <title>Compare Databases</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+
   <style>
     :root {
       --bg: #1e1e2e;
@@ -170,6 +172,20 @@
 
     let currentSQL = "";
 
+    // Text from database servers (names, errors) is never inserted as HTML: this page has full
+    // Node access, so HTML from a server could run code on the user's computer
+    function fillSelect(select, names) {
+      select.replaceChildren(...names.map(name => new Option(name, name)));
+    }
+
+    function showError(el, message) {
+      const span = document.createElement('span');
+      span.style.color = 'var(--error)';
+      span.style.whiteSpace = 'pre-wrap';
+      span.textContent = 'Error: ' + message;
+      el.replaceChildren(span);
+    }
+
     // Native dialog from the main process. The browser's alert()/confirm() leave inputs
     // unable to take typing on Windows until the window is refocused.
     // Returns the index of the clicked button.
@@ -221,6 +237,9 @@
 
       f('type').addEventListener('change', () => applyType(el));
       f('connect').addEventListener('click', () => connect(side));
+      // Any change to the settings makes the current connection outdated
+      el.querySelectorAll('select[data-f], input[data-f]').forEach(input =>
+        input.addEventListener(input.tagName === 'SELECT' ? 'change' : 'input', () => disconnect(side)));
       if (side === 'target') {
         f('copy').addEventListener('click', () => {
           const src = document.getElementById('conn-source');
@@ -243,17 +262,35 @@
       f('connect').textContent = `Connect to ${defaults[type].label}`;
     }
 
+    // Counts requests so an answer that arrives after a newer request was made is ignored
+    const latest = { source: 0, target: 0, compare: 0 };
+
+    function disconnect(side) {
+      const statusEl = document.querySelector(`#conn-${side} [data-f="status"]`);
+      if (!connected[side] && statusEl.textContent !== "Connecting...") return;
+      latest[side]++;
+      connected[side] = null;
+      selects[side].disabled = true;
+      statusEl.textContent = "Settings changed. Click Connect.";
+      statusEl.style.color = "#f9e2af";
+      ipcRenderer.invoke('disconnect-db', { side });
+      clearResult();
+      updateMode();
+    }
+
     async function connect(side) {
       const el = document.getElementById(`conn-${side}`);
       const f = name => el.querySelector(`[data-f="${name}"]`);
       const statusEl = f('status');
       const select = selects[side];
       const type = f('type').value;
+      const request = ++latest[side];
 
       statusEl.textContent = "Connecting...";
       statusEl.style.color = "#a6adc8";
       connected[side] = null;
       select.disabled = true;
+      clearResult();
       updateMode();
 
       const res = await ipcRenderer.invoke('connect-db', {
@@ -266,24 +303,30 @@
         database: f('database').value.trim() || 'postgres',
         schema: f('schema').value.trim() || 'public'
       });
+      if (request !== latest[side] || res.stale) return;
 
       if (res.success) {
         statusEl.textContent = "✅ Connected";
         statusEl.style.color = "var(--success)";
-        select.innerHTML = '';
-        res.dbs.forEach(db => {
-          select.innerHTML += `<option value="${db}">${db}</option>`;
-        });
+        fillSelect(select, res.dbs);
         select.disabled = false;
         connected[side] = type;
-        if (side === 'source') convSourceCb.innerHTML = select.innerHTML;
-        if (side === 'target') convExistingDb.innerHTML = select.innerHTML;
+        if (side === 'source') fillSelect(convSourceCb, res.dbs);
+        if (side === 'target') fillSelect(convExistingDb, res.dbs);
       } else {
         // Shown in place (no popup): the error stays readable and the inputs stay editable
         statusEl.textContent = "❌ " + res.error;
         statusEl.style.color = "var(--error)";
       }
       updateMode();
+    }
+
+    // An old script must not stay on screen (or be run) once the connections change
+    function clearResult() {
+      latest.compare++;
+      currentSQL = "";
+      editorEl.innerHTML = "";
+      runBtn.disabled = copyBtn.disabled = true;
     }
 
     function updateMode() {
@@ -351,7 +394,7 @@
         convCopyBtn.disabled = !convSQL;
         convModeEl.textContent = "✅ This is the PostgreSQL version of the MySQL schema. Lines starting with -- NOTE need your attention.";
       } else {
-        convEditorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
+        showError(convEditorEl, res.error);
       }
     });
 
@@ -386,15 +429,12 @@
         convModeEl.textContent = existing
           ? `❌ Failed. "${newDb}" was rolled back and is unchanged.`
           : "❌ Failed. Nothing was created.";
-        convEditorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
+        showError(convEditorEl, res.error);
         return;
       }
 
       // Refresh the target list and compare the two databases right away
-      selects.target.innerHTML = '';
-      res.dbs.forEach(db => {
-        selects.target.innerHTML += `<option value="${db}">${db}</option>`;
-      });
+      fillSelect(selects.target, res.dbs);
       selects.source.value = source;
       selects.target.value = newDb;
 
@@ -404,7 +444,7 @@
         : `Created PostgreSQL database "${newDb}" from MySQL "${source}"`;
       convEditorEl.innerHTML = syntaxHighlight(`-- ✅ ${what}` +
         (copyData ? ' with its data.' : ' (structure only).') + notes);
-      convExistingDb.innerHTML = selects.target.innerHTML;
+      fillSelect(convExistingDb, res.dbs);
       convExistingDb.value = newDb;
       // Replace data keeps the PostgreSQL structure on purpose, so a compare would list its
       // structural differences from MySQL (even DROP TABLE for PostgreSQL-only tables).
@@ -421,6 +461,9 @@
     renderConn('source');
     renderConn('target');
     updateMode();
+    // A script is only valid for the databases it was generated for
+    selects.source.addEventListener('change', clearResult);
+    selects.target.addEventListener('change', clearResult);
 
     compareBtn.addEventListener('click', async () => {
       const source = selects.source.value;
@@ -435,9 +478,18 @@
         return;
       }
 
+      const request = ++latest.compare;
+      const engines = `${defaults[connected.source].label} → ${defaults[connected.target].label}`;
       editorEl.innerHTML = "Generating...";
-      runBtn.disabled = true;
-      const res = await ipcRenderer.invoke('compare-db', { source, target });
+      runBtn.disabled = copyBtn.disabled = true;
+      compareBtn.disabled = true;
+      currentSQL = "";
+      const res = await ipcRenderer.invoke('compare-db', {
+        source, target, sourceType: connected.source, targetType: connected.target
+      });
+      // A newer compare, connect or settings change happened meanwhile; this answer is outdated
+      if (request !== latest.compare) return;
+      updateMode();
 
       if (res.success) {
         currentSQL = res.sql.trim();
@@ -445,14 +497,14 @@
         if (currentSQL) {
           editorEl.innerHTML = syntaxHighlight(currentSQL);
           copyBtn.disabled = false;
-          modeEl.textContent = "✅ Sync script generated. Run it on the target database.";
+          modeEl.textContent = `✅ ${engines}: sync script generated for ${source} → ${target}. Run it on the target database.`;
         } else {
           editorEl.innerHTML = "";
           copyBtn.disabled = true;
-          modeEl.textContent = "✅ Databases are identical";
+          modeEl.textContent = `✅ ${engines}: ${source} and ${target} are identical`;
         }
       } else {
-        editorEl.innerHTML = `<span style="color:red">Error: ${res.error}</span>`;
+        showError(editorEl, res.error);
       }
     });
 
@@ -460,8 +512,11 @@
     runBtn.addEventListener('click', async () => {
       if (!currentSQL) return;
       const target = selects.target.value;
-      const drops = (currentSQL.match(/^(DROP TABLE|ALTER TABLE \S+ DROP COLUMN)/gm) || []).length;
-      const warning = drops ? `\n\n⚠ It DROPS ${drops} table(s)/column(s). Their data will be deleted.` : '';
+      // Table names may be quoted and contain spaces, so match on the statement shape only
+      const drops = (currentSQL.match(/^(DROP TABLE |ALTER TABLE .* DROP COLUMN )/gm) || []).length;
+      let warning = drops ? `\n\n⚠ It DROPS ${drops} table(s)/column(s). Their data will be deleted.` : '';
+      // MySQL commits every structure change at once, so a failure halfway can't be undone
+      if (connected.target === 'mysql') warning += '\n\nMySQL cannot undo structure changes if a statement fails halfway. Make a backup of the target first.';
       if (await showDialog(`Run this SQL on target database "${target}"?${warning}`, 'warning', ['Run', 'Cancel']) !== 0) return;
 
       runBtn.disabled = true;

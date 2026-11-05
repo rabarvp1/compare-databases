@@ -17,6 +17,10 @@ function createWindow() {
       contextIsolation: false
     }
   });
+  // The page has full Node access, so it must never be replaced by other content
+  // (a dropped .html file, a link) or open new windows
+  mainWindow.webContents.on('will-navigate', event => event.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.loadFile('index.html');
 }
 
@@ -205,8 +209,16 @@ const mysqlDriver = {
       user: config.user,
       password: config.password
     });
-    const [rows] = await conn.query("SHOW DATABASES");
-    return { conn, dbs: rows.map(r => r.Database) };
+    // A connection the server drops while idle reports an error event; without a listener
+    // that would crash the app. The next use then fails with a normal, catchable error.
+    conn.on('error', () => {});
+    try {
+      const [rows] = await conn.query("SHOW DATABASES");
+      return { conn, dbs: rows.map(r => r.Database) };
+    } catch (err) {
+      await conn.end().catch(() => {});
+      throw err;
+    }
   },
 
   async close(session) {
@@ -215,6 +227,10 @@ const mysqlDriver = {
 
   async loadSchema(session, db) {
     const q = this.q;
+    // A missing database looks like an empty one in information_schema, and comparing
+    // against "empty" would generate a script that drops every table
+    const [found] = await session.conn.query('SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?', [db]);
+    if (!found.length) throw new Error(`Database "${db}" does not exist on the MySQL server (deleted or renamed?). Refresh with Connect.`);
     const [tables] = await session.conn.query(`
       SELECT TABLE_NAME AS name
       FROM information_schema.TABLES
@@ -257,7 +273,9 @@ const mysqlDriver = {
         unique: Number(ix.rows[0].nonUnique) === 0,
         type: ix.rows[0].type,
         columns: ix.rows.map(r => r.col),
-        subParts: ix.rows.map(r => r.subPart)
+        subParts: ix.rows.map(r => r.subPart),
+        // Functional (expression) indexes have no column name; they can't be rebuilt from here
+        expression: ix.rows.some(r => r.col === null)
       });
     }
     schema.fks = groupConstraints(fkRows).map(fk => {
@@ -309,29 +327,65 @@ const mysqlDriver = {
     const type = c.type.toLowerCase().replace(/^integer\b/, 'int')
       .replace(/^(tinyint|smallint|mediumint|int|bigint)\(\d+\)/, (m, base) => (m === 'tinyint(1)' ? m : base));
     const extra = (c.extra || '').toLowerCase().replace('default_generated', '').replace(/\s+/g, ' ').trim();
-    return [type, c.nullable, canonDefaultText(c.def), extra, c.generation || ''].join('|');
+    // Collation decides sorting and comparison of text, so a different one is a real difference
+    return [type, c.nullable, canonDefaultText(c.def), extra, c.generation || '', c.collation || ''].join('|');
+  },
+
+  // The value MySQL itself gives a NOT NULL column that has no default
+  implicitValue(c) {
+    const type = c.type.toLowerCase();
+    if (/^enum\(/.test(type)) return /^enum\(('(?:[^']|'')*')/.exec(c.type)?.[1] ?? null;
+    if (/^(tinyint|smallint|mediumint|int|integer|bigint|decimal|numeric|float|double|real|year|bit)/.test(type)) return '0';
+    if (/^(char|varchar|tinytext|text|mediumtext|longtext|set|binary|varbinary|tinyblob|blob|mediumblob|longblob)/.test(type)) return "''";
+    if (/^date$/.test(type)) return "'0000-00-00'";
+    if (/^(datetime|timestamp)/.test(type)) return "'0000-00-00 00:00:00'";
+    if (/^time/.test(type)) return "'00:00:00'";
+    if (/^json/.test(type)) return "'null'";
+    return null;
   },
 
   alterColumn(table, s) {
     const out = [];
-    // Rows with NULL would block NOT NULL, so give them the default first
-    if (s.nullable === 'NO' && s.def !== null && !/GENERATED/i.test(s.extra || '')) {
-      out.push(`UPDATE ${this.q(table)} SET ${this.q(s.name)} = ${this.defaultSql(s)} WHERE ${this.q(s.name)} IS NULL;`);
+    // Rows with NULL would block NOT NULL, so give them the default (or MySQL's own empty value)
+    if (s.nullable === 'NO' && !/GENERATED|auto_increment/i.test(s.extra || '')) {
+      const value = s.def !== null ? this.defaultSql(s) : this.implicitValue(s);
+      if (value !== null) {
+        out.push(`UPDATE ${this.q(table)} SET ${this.q(s.name)} = ${value} WHERE ${this.q(s.name)} IS NULL;`);
+      }
     }
     out.push(`ALTER TABLE ${this.q(table)} MODIFY COLUMN ${this.columnSql(s)};`);
     return out;
   },
 
-  // Indexes of one table in canonical form; the primary key is left alone
+  // Legacy defaults like '0000-00-00' are refused in MySQL 8's default strict mode; this
+  // session allows them again (strict mode itself stays on)
+  wrap(session, sql) {
+    return "SET SESSION sql_mode = (SELECT TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), " +
+      "',NO_ZERO_DATE,', ','), ',NO_ZERO_IN_DATE,', ','), ',,', ',')));\n\n" + sql;
+  },
+
+  // Indexes of one table (primary key included) in canonical form
   indexItems(table, t) {
-    return (t.indexes || []).filter(ix => ix.name !== 'PRIMARY').map(ix => {
-      const kind = ix.type === 'FULLTEXT' ? 'FULLTEXT ' : ix.type === 'SPATIAL' ? 'SPATIAL ' : ix.unique ? 'UNIQUE ' : '';
+    return (t.indexes || []).filter(ix => !ix.expression).map(ix => {
       const part = i => (ix.subParts?.[i] ? `(${ix.subParts[i]})` : '');
+      const list = ix.columns.map((c, i) => this.q(c) + part(i)).join(', ');
+      if (ix.name === 'PRIMARY') {
+        return {
+          name: ix.name, columns: ix.columns, primary: true,
+          canon: 'P:(' + ix.columns.map((c, i) => c + part(i)).join(',') + ')',
+          add: `ALTER TABLE ${this.q(table)} ADD PRIMARY KEY (${list});`,
+          drop: `ALTER TABLE ${this.q(table)} DROP PRIMARY KEY;`,
+          // Replacing a key that holds an AUTO_INCREMENT column must happen in one statement
+          replace: `ALTER TABLE ${this.q(table)} DROP PRIMARY KEY, ADD PRIMARY KEY (${list});`
+        };
+      }
+      const kind = ix.type === 'FULLTEXT' ? 'FULLTEXT ' : ix.type === 'SPATIAL' ? 'SPATIAL ' : ix.unique ? 'UNIQUE ' : '';
       return {
         name: ix.name,
         columns: ix.columns,
+        unique: ix.unique,
         canon: kind + '(' + ix.columns.map((c, i) => c + part(i)).join(',') + ')',
-        add: `ALTER TABLE ${this.q(table)} ADD ${kind}INDEX ${this.q(ix.name)} (${ix.columns.map((c, i) => this.q(c) + part(i)).join(', ')});`,
+        add: `ALTER TABLE ${this.q(table)} ADD ${kind}INDEX ${this.q(ix.name)} (${list});`,
         drop: `ALTER TABLE ${this.q(table)} DROP INDEX ${this.q(ix.name)};`
       };
     });
@@ -383,6 +437,32 @@ function pgUsing(col, from, to, toSpelled) {
   return `${col}::${toSpelled}`;
 }
 
+// Column names inside the first parentheses, e.g. UNIQUE ("a", b) or USING btree (a, b) -> [a, b]
+function pgColumnList(text) {
+  const inner = /\(((?:[^()"]|"(?:[^"]|"")*")*)\)/.exec(text)?.[1] ?? '';
+  return (inner.match(/"(?:[^"]|"")*"|[^,]+/g) || [])
+    .map(s => s.trim()).filter(Boolean)
+    .map(s => (s.startsWith('"') ? s.slice(1, -1).replace(/""/g, '"') : s));
+}
+
+// The "empty" value MySQL would give a NOT NULL column without a default, for a PostgreSQL type;
+// null when there is no sensible one (the statement then fails with PostgreSQL's own message)
+function pgImplicitValue(type) {
+  const t = pgCanonType(type);
+  if (/^(smallint|integer|bigint|numeric|real|double precision)/.test(t)) return '0';
+  if (/^(character varying|character|text)/.test(t)) return "''";
+  if (t === 'boolean') return 'false';
+  if (t === 'date') return "'1970-01-01'";
+  if (/^timestamp/.test(t)) return "'1970-01-01 00:00:00'";
+  if (/^time/.test(t)) return "'00:00:00'";
+  if (t === 'json' || t === 'jsonb') return "'null'";
+  if (t === 'bytea') return "''";
+  if (t === 'uuid') return "'00000000-0000-0000-0000-000000000000'";
+  const bits = /^bit\((\d+)\)$/.exec(t);
+  if (bits) return `B'${'0'.repeat(Number(bits[1]))}'`;
+  return null;
+}
+
 const postgresDriver = {
   q: n => '"' + String(n).replace(/"/g, '""') + '"',
 
@@ -394,6 +474,8 @@ const postgresDriver = {
       password: config.password,
       database
     });
+    // Same as for MySQL: a dropped connection must not crash the app
+    client.on('error', () => {});
     await client.connect();
     return client;
   },
@@ -468,7 +550,10 @@ const postgresDriver = {
       const schema = { db, tables: {}, fks: [], enums: enums.rows };
       for (const t of tables.rows) schema.tables[t.name] = { columns: [], constraints: [], indexes: [] };
       for (const c of columns.rows) schema.tables[c.tbl]?.columns.push(c);
-      for (const i of indexes.rows) schema.tables[i.tbl]?.indexes.push(i.def);
+      // pg_get_indexdef writes "ON public.t"; without the schema the index is created in the
+      // target's schema even when it has another name
+      const qualified = new RegExp(` ON (ONLY )?(?:${this.q(ns).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}|${ns.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\.`);
+      for (const i of indexes.rows) schema.tables[i.tbl]?.indexes.push(i.def.replace(qualified, ' ON $1'));
       for (const con of constraints.rows) {
         if (!schema.tables[con.tbl]) continue;
         if (con.type === 'f') schema.fks.push({ table: con.tbl, name: con.name, def: con.def });
@@ -509,7 +594,9 @@ const postgresDriver = {
 
   // Conversion warnings (set by mysqlToPostgres) become comments above the statement
   notesSql(notes) {
-    return (notes || []).map(n => `-- NOTE: ${n}\n`).join('');
+    // A line break inside a note (from a name or expression) would end the comment and turn
+    // the rest into a live statement
+    return (notes || []).map(n => `-- NOTE: ${String(n).replace(/[\r\n]+/g, ' ')}\n`).join('');
   },
 
   // Foreign keys are left out here and added later, so table order does not matter
@@ -528,9 +615,21 @@ const postgresDriver = {
 
   // Checks and unique keys for the new column are added by the index/constraint step
   addColumn(schema, table, column) {
-    return this.wrapSequence(table, column, [
-      this.notesSql(column.notes) + `ALTER TABLE ${this.q(table)} ADD COLUMN ${this.columnSql(column)};`
-    ]).join('\n\n');
+    const q = this.q;
+    const statements = [];
+    // A NOT NULL column without a default can't be added to a table that has rows, so it is
+    // added as NULL, existing rows get an empty value (as MySQL does), then NOT NULL is set
+    const empty = column.notnull && column.def == null && !column.identity && !column.generated ? pgImplicitValue(column.type) : null;
+    if (empty !== null) {
+      statements.push(this.notesSql([...(column.notes || []),
+        `${table}.${column.name} is NOT NULL without a default; existing rows get ${empty}.`]) +
+        `ALTER TABLE ${q(table)} ADD COLUMN ${this.columnSql({ ...column, notnull: false })};`);
+      statements.push(`UPDATE ${q(table)} SET ${q(column.name)} = ${empty} WHERE ${q(column.name)} IS NULL;`);
+      statements.push(`ALTER TABLE ${q(table)} ALTER COLUMN ${q(column.name)} SET NOT NULL;`);
+    } else {
+      statements.push(this.notesSql(column.notes) + `ALTER TABLE ${q(table)} ADD COLUMN ${this.columnSql(column)};`);
+    }
+    return this.wrapSequence(table, column, statements).join('\n\n');
   },
 
   columnSig(c) {
@@ -545,7 +644,7 @@ const postgresDriver = {
     const q = this.q;
     const col = `ALTER TABLE ${q(table)} ALTER COLUMN ${q(s.name)}`;
     if (s.generated || t.generated) {
-      return [`-- NOTE: ${table}.${s.name} is a generated column with a different definition; change it by hand.`];
+      return [this.notesSql([`${table}.${s.name} is a generated column with a different definition; change it by hand.`]).trim()];
     }
     const out = [];
     const sType = pgCanonType(s.type), tType = pgCanonType(t.type);
@@ -564,9 +663,9 @@ const postgresDriver = {
       out.push(`${col} TYPE ${s.type} USING ${pgUsing(q(s.name), tType, sType, s.type)};`);
     }
     if (s.notnull && !t.notnull) {
-      if (s.def != null && sDef !== 'AUTO') {
-        out.push(`UPDATE ${q(table)} SET ${q(s.name)} = ${s.def} WHERE ${q(s.name)} IS NULL;`);
-      }
+      // Rows with NULL would block NOT NULL: give them the default, or an empty value
+      const fill = s.def != null && sDef !== 'AUTO' ? s.def : sDef === 'AUTO' ? null : pgImplicitValue(s.type);
+      if (fill !== null) out.push(`UPDATE ${q(table)} SET ${q(s.name)} = ${fill} WHERE ${q(s.name)} IS NULL;`);
       out.push(`${col} SET NOT NULL;`);
     } else if (!s.notnull && t.notnull) {
       out.push(`${col} DROP NOT NULL;`);
@@ -589,20 +688,28 @@ const postgresDriver = {
     const q = this.q;
     const items = [];
     for (const con of t.constraints || []) {
-      if (con.type !== 'u' && con.type !== 'c') continue;
+      if (!['p', 'u', 'c'].includes(con.type)) continue;
+      const keyCols = con.type === 'c' ? null : pgColumnList(con.def);
       items.push({
         name: con.name,
-        canon: con.type === 'u' ? 'U:' + con.def.replace(/^UNIQUE\s*/i, '').replace(/["\s]/g, '') : 'C:' + pgCanonCheck(con.def),
+        columns: keyCols,
+        primary: con.type === 'p',
+        unique: con.type === 'u',
+        canon: con.type === 'c' ? 'C:' + pgCanonCheck(con.def) : (con.type === 'p' ? 'P:' : 'U:') + '(' + keyCols.join(',') + ')',
         add: `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(con.name)} ${con.def};`,
         drop: `ALTER TABLE ${q(table)} DROP CONSTRAINT ${q(con.name)};`
       });
     }
     for (const def of t.indexes || []) {
-      const m = /^CREATE (UNIQUE )?INDEX (?:CONCURRENTLY )?(?:IF NOT EXISTS )?("(?:[^"]|"")+"|\S+) ON (?:ONLY )?(?:"(?:[^"]|"")+"|\S+)\s*(.*)$/i.exec(def);
+      // The table may be schema-qualified and quoted, e.g. public."mixedcase table"
+      const ident = '(?:"(?:[^"]|"")+"|[^\\s."]+)';
+      const m = new RegExp(`^CREATE (UNIQUE )?INDEX (?:CONCURRENTLY )?(?:IF NOT EXISTS )?(${ident}) ON (?:ONLY )?(?:${ident}\\.)?${ident}\\s*(.*)$`, 'i').exec(def);
       if (!m) continue;
       const rest = m[3].replace(/^USING btree\s*/i, '').replace(/["\s]/g, '');
       items.push({
         name: m[2].replace(/^"|"$/g, '').replace(/""/g, '"'),
+        columns: pgColumnList(m[3]),
+        unique: !!m[1],
         canon: (m[1] ? 'U:' : 'I:') + rest,
         add: def + ';',
         drop: `DROP INDEX ${m[2]};`
@@ -642,56 +749,108 @@ const postgresDriver = {
 
 // ---------------------------------------------------------------- MySQL -> PostgreSQL
 
+// PostgreSQL names are at most 63 bytes; longer ones are cut silently
 const PG_MAX_NAME = 63;
 
+function truncateBytes(s, max) {
+  let out = '';
+  for (const ch of s) {
+    if (Buffer.byteLength(out + ch) > max) break;
+    out += ch;
+  }
+  return out;
+}
+
+// A name PostgreSQL keeps exactly as given and that is not taken yet in `used`. Too long or
+// taken names get a short hash of `key` (what the name stands for), so two long names can never
+// become one, and the same MySQL schema always gives the same names.
+function pgSafeName(name, used, key = name) {
+  let out = name;
+  if (Buffer.byteLength(name) > PG_MAX_NAME || used.has(out)) {
+    const hash = require('crypto').createHash('md5').update(key).digest('hex').slice(0, 8);
+    out = truncateBytes(name, PG_MAX_NAME - 9) + '_' + hash;
+    for (let i = 2; used.has(out); i++) out = truncateBytes(name, PG_MAX_NAME - 10 - String(i).length) + '_' + hash + i;
+  }
+  used.add(out);
+  return out;
+}
+
 // Rewrites a schema from mysqlDriver.loadSchema into the shape postgresDriver.loadSchema
-// returns, so a MySQL source can be compared against (and created in) a PostgreSQL target
+// returns, so a MySQL source can be compared against (and created in) a PostgreSQL target.
+// Tables and columns remember their MySQL name in `source` for the data copy.
 function mysqlToPostgres(schema) {
   const q = postgresDriver.q;
-  const pgName = n => n.slice(0, PG_MAX_NAME);
-  const cols = list => list.map(q).join(', ');
   const out = { db: schema.db, tables: {}, fks: [], enums: [] };
 
-  // MySQL index names are per table, PostgreSQL ones are per schema
+  // Tables, indexes and the indexes behind primary/unique keys share one namespace per schema
+  const relations = new Set();
+  const tableName = {};
+  for (const table of Object.keys(schema.tables)) tableName[table] = pgSafeName(table, relations);
+  const columnName = {};
+  for (const [table, t] of Object.entries(schema.tables)) {
+    const used = new Set();
+    columnName[table] = {};
+    for (const c of t.columns) columnName[table][c.name] = pgSafeName(c.name, used);
+  }
+  const cols = (table, list) => list.map(c => q(columnName[table][c] ?? c)).join(', ');
+  // Other constraint names (checks, foreign keys) only need to be unique per table
+  const constraintNames = {};
+  const constraintsOf = table => (constraintNames[table] ??= new Set());
+
+  // MySQL index names are per table, so the same name on two tables gets the table as prefix
   const nameUse = {};
   for (const t of Object.values(schema.tables)) {
     for (const ix of t.indexes) nameUse[ix.name] = (nameUse[ix.name] || 0) + 1;
   }
   const indexName = (table, name) =>
-    pgName(nameUse[name] > 1 || schema.tables[name] ? `${table}_${name}` : name);
+    pgSafeName(nameUse[name] > 1 || schema.tables[name] ? `${tableName[table]}_${name}` : name, relations, `${table}.${name}`);
 
   for (const [table, t] of Object.entries(schema.tables)) {
-    const pt = { columns: [], constraints: [], indexes: [], notes: [] };
-    out.tables[table] = pt;
+    const pgTable = tableName[table];
+    const pt = { source: table, columns: [], constraints: [], indexes: [], notes: [] };
+    out.tables[pgTable] = pt;
 
     for (const c of t.columns) {
-      const { column, check } = convertMysqlColumn(table, c);
+      const { column, check } = convertMysqlColumn(pgTable, { ...c, name: columnName[table][c.name] });
+      column.source = c.name;
       pt.columns.push(column);
-      if (check) pt.constraints.push(check);
+      if (check) {
+        check.name = pgSafeName(`${pgTable}_${column.name}_check`, constraintsOf(table), `${table}.${c.name}.check`);
+        pt.constraints.push(check);
+      }
     }
 
     for (const ix of t.indexes) {
       if (ix.name === 'PRIMARY') {
-        pt.constraints.unshift({ name: pgName(`${table}_pkey`), type: 'p', def: `PRIMARY KEY (${cols(ix.columns)})` });
+        const name = pgSafeName(`${pgTable}_pkey`, relations, `${table}.PRIMARY`);
+        pt.constraints.unshift({ name, type: 'p', def: `PRIMARY KEY (${cols(table, ix.columns)})` });
+      } else if (ix.expression) {
+        pt.notes.push(`Expression index ${ix.name} on ${table} was skipped; create it by hand.`);
       } else if (ix.type === 'FULLTEXT' || ix.type === 'SPATIAL') {
         pt.notes.push(`${ix.type} index ${ix.name} on ${table} was skipped; create it by hand (e.g. a GIN/GiST index).`);
       } else if (ix.unique) {
-        pt.constraints.push({ name: indexName(table, ix.name), type: 'u', def: `UNIQUE (${cols(ix.columns)})` });
+        pt.constraints.push({ name: indexName(table, ix.name), type: 'u', def: `UNIQUE (${cols(table, ix.columns)})` });
       } else {
-        pt.indexes.push(`CREATE INDEX ${q(indexName(table, ix.name))} ON ${q(table)} (${cols(ix.columns)})`);
+        pt.indexes.push(`CREATE INDEX ${q(indexName(table, ix.name))} ON ${q(pgTable)} (${cols(table, ix.columns)})`);
       }
     }
   }
 
   // NO ACTION is the default and pg_get_constraintdef() leaves it out, so we do too
   out.fks = schema.fks.map(fk => ({
-    table: fk.table,
-    name: pgName(fk.name),
-    def: `FOREIGN KEY (${cols(fk.columns)}) REFERENCES ${q(fk.refTable)}(${cols(fk.refColumns)})` +
+    table: tableName[fk.table],
+    name: pgSafeName(fk.name, constraintsOf(fk.table), `${fk.table}.${fk.name}`),
+    def: `FOREIGN KEY (${cols(fk.table, fk.columns)}) REFERENCES ${q(tableName[fk.refTable] ?? fk.refTable)}(${cols(fk.refTable, fk.refColumns)})` +
          (fk.onUpdate !== 'NO ACTION' ? ` ON UPDATE ${fk.onUpdate}` : '') +
          (fk.onDelete !== 'NO ACTION' ? ` ON DELETE ${fk.onDelete}` : '')
   }));
   return out;
+}
+
+// The values of a MySQL enum/set list such as 'a','it''s','back\\slash'
+function mysqlEnumValues(list) {
+  return [...String(list).matchAll(/'((?:[^'\\]|''|\\.)*)'/g)]
+    .map(m => m[1].replace(/''/g, "'").replace(/\\(.)/g, '$1'));
 }
 
 function convertMysqlColumn(table, c) {
@@ -727,8 +886,10 @@ function convertMysqlColumn(table, c) {
   else if (base === 'enum') {
     // Same approach Laravel uses on PostgreSQL: varchar + CHECK constraint
     column.type = 'character varying(255)';
+    // MySQL writes \ as \\ inside the list; PostgreSQL literals take it as is
+    const values = mysqlEnumValues(args).map(v => `'${v.replace(/'/g, "''")}'`).join(', ');
     check = { name: `${table}_${c.name}`.slice(0, PG_MAX_NAME - 6) + '_check', type: 'c', column: c.name,
-              def: `CHECK (${postgresDriver.q(c.name)} IN (${args}))` };
+              def: `CHECK (${postgresDriver.q(c.name)} IN (${values}))` };
   } else {
     column.type = 'text';
     notes.push(`${table}.${c.name}: MySQL type ${c.type} has no direct PostgreSQL match, used text.`);
@@ -764,19 +925,49 @@ const drivers = { mysql: mysqlDriver, postgres: postgresDriver };
 // The source and target each have their own server connection
 const sessions = {};
 
+// Latest connect attempt per side. A slower, older attempt that finishes afterwards
+// must not replace the newer connection (e.g. a PostgreSQL connect overtaking a MySQL one).
+const connectAttempts = {};
+
+async function dropSession(side) {
+  const old = sessions[side];
+  delete sessions[side];
+  if (old) await old.driver.close(old).catch(() => {});
+}
+
 ipcMain.handle('connect-db', async (event, { side, ...config }) => {
+  const attempt = {};
+  connectAttempts[side] = attempt;
   try {
-    const old = sessions[side];
-    delete sessions[side];
-    if (old) await old.driver.close(old).catch(() => {});
+    await dropSession(side);
     const driver = drivers[config.type];
     const { conn, dbs } = await driver.connect(config);
+    if (connectAttempts[side] !== attempt) {
+      await driver.close({ conn }).catch(() => {});
+      return { success: false, stale: true };
+    }
     sessions[side] = { driver, config, conn };
     return { success: true, dbs };
   } catch (err) {
-    return { success: false, error: err.message };
+    return { success: false, stale: connectAttempts[side] !== attempt, error: dbErrorMessage(err) };
   }
 });
+
+// Settings changed in the window: the old connection must not be used any more
+ipcMain.handle('disconnect-db', async (event, { side }) => {
+  connectAttempts[side] = {};
+  await dropSession(side);
+});
+
+// Lost connections (server restarted, idle timeout, network) get a clear next step
+function dbErrorMessage(err) {
+  const msg = String(err && err.message || err);
+  if (/closed state|PROTOCOL_CONNECTION_LOST|ECONNRESET|Connection terminated|Client has encountered a connection error|connection is not open|server closed the connection/i.test(msg)) {
+    return 'The connection to the database server was lost (server restarted, network, or idle timeout). Click Connect again, then retry.';
+  }
+  if (/ECONNREFUSED/.test(msg)) return `Cannot reach the database server (${msg}). Check that it is running and that host and port are right.`;
+  return msg;
+}
 
 function requireSessions() {
   const srcSession = sessions.source;
@@ -785,11 +976,15 @@ function requireSessions() {
   return { srcSession, tgtSession };
 }
 
-ipcMain.handle('compare-db', async (event, { source, target }) => {
+ipcMain.handle('compare-db', async (event, { source, target, sourceType, targetType }) => {
   try {
     const { srcSession, tgtSession } = requireSessions();
     const srcType = srcSession.config.type;
     const tgtType = tgtSession.config.type;
+    // The window says which engines it shows; never answer for a different connection
+    if ((sourceType && sourceType !== srcType) || (targetType && targetType !== tgtType)) {
+      throw new Error('The connection changed while comparing. Click Connect on both servers, then compare again.');
+    }
     if (srcType !== tgtType && !(srcType === 'mysql' && tgtType === 'postgres')) {
       throw new Error('Only MySQL → PostgreSQL conversion is supported between different engines.');
     }
@@ -801,7 +996,7 @@ ipcMain.handle('compare-db', async (event, { source, target }) => {
     if (srcType !== tgtType) src = mysqlToPostgres(src);
     return { success: true, sql: await buildSyncSql(d, srcSession, tgtSession, src, tgt) };
   } catch (err) {
-    return { success: false, error: err.message };
+    return { success: false, error: dbErrorMessage(err) };
   }
 });
 
@@ -838,21 +1033,38 @@ async function buildSyncSql(d, srcSession, tgtSession, src, tgt) {
   };
   const fkSig = fk => `${fk.table}\0${fk.name}\0${fk.def.replace(/[\s"`]/g, '')}`;
   const srcFks = new Set(src.fks.map(fkSig));
-  const keptFks = tgt.fks.filter(fk => srcFks.has(fkSig(fk)) && !touchesChanged(fk));
-  const keptSigs = new Set(keptFks.map(fkSig));
 
-  section('Drop foreign keys that are missing, different or on changed columns',
-    tgt.fks.filter(fk => !keptSigs.has(fkSig(fk))).map(fk => d.dropForeignKey(fk)));
-
-  // Unique keys, checks and indexes on tables both sides have
-  const dropIdx = [], addIdx = [];
+  // Keys, checks and indexes on tables both sides have, compared by canonical form
+  const indexDiff = {};
   for (const t of sharedTables) {
     const want = d.indexItems(t, src.tables[t]);
     const have = d.indexItems(t, tgt.tables[t]);
     const wantCanon = new Set(want.map(i => i.canon));
     const haveCanon = new Set(have.map(i => i.canon));
-    const dropping = have.filter(i => !wantCanon.has(i.canon));
+    indexDiff[t] = { have, dropping: have.filter(i => !wantCanon.has(i.canon)), adding: want.filter(i => !haveCanon.has(i.canon)) };
+  }
+  // A foreign key pointing at a primary/unique key that is about to be dropped would block
+  // the drop, so it goes too and is added back afterwards
+  const sameCols = (a, b) => a && b && a.length === b.length && a.every((c, i) => c === b[i]);
+  const parentKeyDropped = fk => {
+    const p = fkParts(fk);
+    return p && (indexDiff[p.refTable]?.dropping || [])
+      .some(i => (i.primary || i.unique) && sameCols(i.columns, p.refColumns));
+  };
+  const keptFks = tgt.fks.filter(fk => srcFks.has(fkSig(fk)) && !touchesChanged(fk) && !parentKeyDropped(fk));
+  const keptSigs = new Set(keptFks.map(fkSig));
+
+  section('Drop foreign keys that are missing, different or depend on something that changes',
+    tgt.fks.filter(fk => !keptSigs.has(fkSig(fk))).map(fk => d.dropForeignKey(fk)));
+
+  const dropIdx = [], addIdx = [];
+  for (const t of sharedTables) {
+    const { have, dropping, adding } = indexDiff[t];
+    // MySQL: replacing the primary key is one statement (needed when it holds AUTO_INCREMENT)
+    const oldPk = dropping.find(i => i.primary && i.replace);
+    const newPk = adding.find(i => i.primary);
     for (const ix of dropping) {
+      if (ix === oldPk && newPk) continue;
       // An index a remaining foreign key still needs can't go (MySQL); one with the same
       // columns is usually created right after anyway
       if (d.needsIndexForFks) {
@@ -866,7 +1078,7 @@ async function buildSyncSql(d, srcSession, tgtSession, src, tgt) {
       }
       dropIdx.push(ix.drop);
     }
-    addIdx.push(...want.filter(i => !haveCanon.has(i.canon)).map(i => i.add));
+    addIdx.push(...adding.map(i => (i === newPk && oldPk ? newPk.replace : i.add)));
   }
   section('Drop indexes and constraints that are missing or different in source', dropIdx);
 
@@ -894,12 +1106,13 @@ async function buildSyncSql(d, srcSession, tgtSession, src, tgt) {
   section('Add foreign keys',
     src.fks.filter(fk => !keptSigs.has(fkSig(fk))).map(fk => d.addForeignKey(fk)));
 
+  // Generated columns go first: the columns they are computed from can't be dropped before them
+  const isGenerated = c => !!c.generated || /GENERATED/i.test((c.extra || '').replace(/DEFAULT_GENERATED/i, ''));
   const dropCols = [];
   for (const t of sharedTables) {
     const wanted = new Set(src.tables[t].columns.map(c => c.name));
-    for (const c of tgt.tables[t].columns) {
-      if (!wanted.has(c.name)) dropCols.push(d.dropColumn(t, c.name));
-    }
+    const extra = tgt.tables[t].columns.filter(c => !wanted.has(c.name));
+    for (const c of [...extra.filter(isGenerated), ...extra.filter(c => !isGenerated(c))]) dropCols.push(d.dropColumn(t, c.name));
   }
   section('Drop extra columns', dropCols);
 
@@ -935,11 +1148,20 @@ ipcMain.handle('run-sql', async (event, { target, sql }) => {
     }
     return { success: true };
   } catch (err) {
-    return { success: false, error: err.message };
+    return { success: false, error: dbErrorMessage(err) + dataConflictHint(err.message) };
   } finally {
     if (conn) await conn.end().catch(() => {});
   }
 });
+
+// The structure change itself is fine; existing rows break the new rule
+function dataConflictHint(message) {
+  if (/violates|is violated by some row|contains null values|Duplicate entry|could not create unique index|Data truncated|Cannot add or update a child row|Invalid use of NULL/i.test(message)) {
+    return '\n\nSome existing rows in the target do not fit the new structure (for example a value no longer allowed, ' +
+      'a duplicate in a new unique key, or a row whose parent is missing). Fix or remove those rows, then run again.';
+  }
+  return '';
+}
 
 // ---------------------------------------------------------------- MySQL -> new PostgreSQL database
 
@@ -967,7 +1189,7 @@ ipcMain.handle('convert-preview', async (event, { source }) => {
     const { srcSession, tgtSession, src } = await loadConvertedSchema(source);
     return { success: true, sql: await buildSyncSql(postgresDriver, srcSession, tgtSession, src, EMPTY_SCHEMA) };
   } catch (err) {
-    return { success: false, error: err.message };
+    return { success: false, error: dbErrorMessage(err) };
   }
 });
 
@@ -994,7 +1216,11 @@ ipcMain.handle('convert-create', async (event, { source, newDb, existing, copyDa
     if (!existing) {
       if (exists.rowCount) throw new Error(`Database "${newDb}" already exists. Pick a new name, or choose "Existing".`);
       progress(`Creating database ${newDb}...`);
-      await admin.query(`CREATE DATABASE ${q(newDb)}`);
+      // MySQL text is Unicode; when the server's template is not UTF8, start from template0 in UTF8
+      const tpl = await admin.query("SELECT pg_encoding_to_char(encoding) AS enc FROM pg_database WHERE datname = 'template1'");
+      await admin.query(tpl.rows[0]?.enc === 'UTF8'
+        ? `CREATE DATABASE ${q(newDb)}`
+        : `CREATE DATABASE ${q(newDb)} ENCODING 'UTF8' TEMPLATE template0`);
       created = true;
     }
 
@@ -1043,17 +1269,23 @@ ipcMain.handle('convert-create', async (event, { source, newDb, existing, copyDa
     // [table, columns to fill]; for existing tables, only the columns both sides have
     const fills = newTables.map(t => [t, src.tables[t].columns]);
     for (const t of replaced) {
-      const mysqlCols = new Set(src.tables[t].columns.map(c => c.name));
+      // PostgreSQL column name -> MySQL column name (they differ only for over-long names)
+      const sourceOf = new Map(src.tables[t].columns.map(c => [c.name, c.source || c.name]));
       const pgCols = tgt.tables[t].columns.filter(c => !c.generated);
-      const missing = [...mysqlCols].filter(c => !pgCols.some(p => p.name === c));
+      const missing = [...sourceOf.keys()].filter(c => !pgCols.some(p => p.name === c));
       if (missing.length) warnings.push(`${t}: MySQL column(s) ${missing.join(', ')} do not exist in PostgreSQL and were not copied.`);
-      fills.push([t, pgCols.filter(c => mysqlCols.has(c.name))]);
+      fills.push([t, pgCols.filter(c => sourceOf.has(c.name)).map(c => ({ ...c, source: sourceOf.get(c.name) }))]);
     }
 
     if (copyData) {
-      for (const [t, cols] of fills) {
-        const count = await copyTable(srcSession, source, client, t, cols, warnings, progress);
-        progress(`Copied ${count} rows into ${t}`);
+      const sourceConn = await openCopySource(srcSession, source);
+      try {
+        for (const [t, cols] of fills) {
+          const count = await copyTable(sourceConn, src.tables[t].source || t, client, t, cols, warnings, progress);
+          progress(`Copied ${count} rows into ${t}`);
+        }
+      } finally {
+        await sourceConn.end().catch(() => {});
       }
       // Rows were inserted with explicit ids, so move each id counter past them
       for (const [t, cols] of fills) {
@@ -1099,7 +1331,7 @@ ipcMain.handle('convert-create', async (event, { source, newDb, existing, copyDa
     }
     client = null;
     if (created) await admin.query(`DROP DATABASE IF EXISTS ${q(newDb)}`).catch(() => {});
-    return { success: false, error: err.message };
+    return { success: false, error: dbErrorMessage(err) };
   } finally {
     if (client) await client.end().catch(() => {});
     if (admin) await admin.end().catch(() => {});
@@ -1108,34 +1340,56 @@ ipcMain.handle('convert-create', async (event, { source, newDb, existing, copyDa
 
 const COPY_BATCH_PARAMS = 30000;
 
-// cols: the PostgreSQL columns to fill, each with its PostgreSQL type
-async function copyTable(srcSession, db, client, table, cols, warnings, progress) {
-  const q = postgresDriver.q;
-  // Strings keep dates, big integers and decimals exactly as stored in MySQL
+// One MySQL connection for the whole copy, reading every table from the same moment
+// (a consistent snapshot), so rows added meanwhile on a live server can't break foreign keys
+async function openCopySource(srcSession, db) {
   const conn = await mysql.createConnection({
     host: srcSession.config.host,
     port: srcSession.config.port,
     user: srcSession.config.user,
     password: srcSession.config.password,
     database: db,
+    // Strings keep dates, big integers, decimals and JSON exactly as stored in MySQL
     dateStrings: true,
     supportBigNumbers: true,
-    bigNumberStrings: true
+    bigNumberStrings: true,
+    jsonStrings: true
   });
-  let zeroDates = 0, total = 0, batch = [];
+  conn.on('error', () => {});
+  await conn.query('START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY');
+  return conn;
+}
+
+// A date MySQL accepts but PostgreSQL can't store: zero year, month or day (0000-00-00, 2020-00-15)
+const INVALID_DATE = /^(0000-\d\d-\d\d|\d{4}-00-\d\d|\d{4}-\d\d-00)/;
+
+// cols: the PostgreSQL columns to fill, each with its PostgreSQL type and, in `source`,
+// its MySQL name when that differs
+async function copyTable(conn, mysqlTable, client, table, cols, warnings, progress) {
+  const q = postgresDriver.q;
+  if (!cols.length) {
+    warnings.push(`${table}: no column exists on both sides, so no data was copied.`);
+    return 0;
+  }
+  let zeroDates = 0, nulChars = 0, total = 0, batch = [];
   const perBatch = Math.max(1, Math.floor(COPY_BATCH_PARAMS / cols.length));
 
   const convert = (value, col) => {
     if (value === null || value === undefined) return null;
-    if (typeof value === 'string' && /^0000-00-00/.test(value)) {
+    const type = pgCanonType(col.type);
+    if (/^(date|timestamp)/.test(type) && typeof value === 'string' && INVALID_DATE.test(value)) {
       zeroDates++;
-      return col.notnull ? (col.type === 'date' ? '1970-01-01' : '1970-01-01 00:00:00') : null;
+      return col.notnull ? (type === 'date' ? '1970-01-01' : '1970-01-01 00:00:00') : null;
     }
-    if (col.type === 'boolean') return Buffer.isBuffer(value) ? value.some(b => b !== 0) : Number(value) !== 0;
-    if (Buffer.isBuffer(value) && col.type.startsWith('bit')) {
-      return [...value].map(b => b.toString(2).padStart(8, '0')).join('').slice(-Number(/\d+/.exec(col.type)[0]));
+    if (type === 'boolean') return Buffer.isBuffer(value) ? value.some(b => b !== 0) : Number(value) !== 0;
+    if (Buffer.isBuffer(value) && type.startsWith('bit')) {
+      return [...value].map(b => b.toString(2).padStart(8, '0')).join('').slice(-Number(/\d+/.exec(type)[0]));
     }
-    if ((col.type === 'json' || col.type === 'jsonb') && typeof value !== 'string') return JSON.stringify(value);
+    // PostgreSQL text can't hold the NUL character
+    if (typeof value === 'string' && type !== 'bytea' && value.includes('\0')) {
+      nulChars++;
+      return value.replace(/\0/g, '');
+    }
     return value;
   };
 
@@ -1143,7 +1397,7 @@ async function copyTable(srcSession, db, client, table, cols, warnings, progress
     if (!batch.length) return;
     const params = [];
     const rows = batch.map(row => '(' + cols.map(c => {
-      params.push(convert(row[c.name], c));
+      params.push(convert(row[c.source || c.name], c));
       return '$' + params.length;
     }).join(', ') + ')');
     // OVERRIDING SYSTEM VALUE keeps MySQL's ids even in GENERATED ALWAYS identity columns
@@ -1154,7 +1408,7 @@ async function copyTable(srcSession, db, client, table, cols, warnings, progress
   };
 
   try {
-    const stream = conn.connection.query(`SELECT * FROM ${mysqlDriver.q(table)}`).stream();
+    const stream = conn.connection.query(`SELECT * FROM ${mysqlDriver.q(mysqlTable)}`).stream();
     for await (const row of stream) {
       batch.push(row);
       if (batch.length >= perBatch) await flush();
@@ -1163,12 +1417,13 @@ async function copyTable(srcSession, db, client, table, cols, warnings, progress
   } catch (err) {
     const hint = /out of range for type bigint/.test(err.message)
       ? ' (a MySQL "bigint unsigned" value is above PostgreSQL\'s bigint limit 9223372036854775807)'
-      : '';
+      : /date\/time field value out of range|invalid input syntax for type time/.test(err.message)
+        ? ' (MySQL TIME can hold durations like 25:00:00 or negative times; PostgreSQL time only holds 00:00:00-24:00:00)'
+        : '';
     throw new Error(`Copying table ${table} failed: ${err.message}${hint}`);
-  } finally {
-    await conn.end().catch(() => {});
   }
-  if (zeroDates) warnings.push(`${table}: ${zeroDates} zero date value(s) like '0000-00-00' became NULL (or 1970-01-01 in NOT NULL columns).`);
+  if (zeroDates) warnings.push(`${table}: ${zeroDates} invalid date value(s) like '0000-00-00' became NULL (or 1970-01-01 in NOT NULL columns).`);
+  if (nulChars) warnings.push(`${table}: ${nulChars} text value(s) contained the NUL character, which PostgreSQL can't store; it was removed.`);
   return total;
 }
 
