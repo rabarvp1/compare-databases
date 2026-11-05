@@ -178,6 +178,11 @@
       select.replaceChildren(...names.map(name => new Option(name, name)));
     }
 
+    // Notes about views/triggers/functions as SQL comments (one line each, so nothing can escape the comment)
+    function notesText(notes) {
+      return (notes || []).map(n => '-- NOTE: ' + String(n).replace(/[\r\n]+/g, ' ')).join('\n');
+    }
+
     function showError(el, message) {
       const span = document.createElement('span');
       span.style.color = 'var(--error)';
@@ -389,7 +394,8 @@
       convEditorEl.innerHTML = "Converting...";
       const res = await ipcRenderer.invoke('convert-preview', { source: convSourceCb.value });
       if (res.success) {
-        convSQL = res.sql.trim();
+        const notes = notesText(res.notes);
+        convSQL = (notes ? notes + '\n\n' : '') + res.sql.trim();
         convEditorEl.innerHTML = convSQL ? syntaxHighlight(convSQL) : "This MySQL database has no tables.";
         convCopyBtn.disabled = !convSQL;
         convModeEl.textContent = "✅ This is the PostgreSQL version of the MySQL schema. Lines starting with -- NOTE need your attention.";
@@ -492,15 +498,19 @@
       updateMode();
 
       if (res.success) {
-        currentSQL = res.sql.trim();
+        const sql = res.sql.trim();
+        const notes = notesText(res.notes);
+        // Notes are comments, so they can stay in the script that is copied or run
+        currentSQL = sql ? (notes ? notes + '\n\n' : '') + sql : '';
         runBtn.disabled = !currentSQL;
-        if (currentSQL) {
-          editorEl.innerHTML = syntaxHighlight(currentSQL);
-          copyBtn.disabled = false;
-          modeEl.textContent = `✅ ${engines}: sync script generated for ${source} → ${target}. Run it on the target database.`;
+        copyBtn.disabled = !currentSQL;
+        editorEl.innerHTML = syntaxHighlight(currentSQL || notes);
+        if (sql) {
+          modeEl.textContent = `✅ ${engines}: sync script generated for ${source} → ${target}. Run it on the target database.` +
+            (notes ? ' Read the notes at the top first.' : '');
+        } else if (notes) {
+          modeEl.textContent = `⚠ ${engines}: the tables of ${source} and ${target} are identical, but some views, triggers or functions differ (listed below; not synced by this tool).`;
         } else {
-          editorEl.innerHTML = "";
-          copyBtn.disabled = true;
           modeEl.textContent = `✅ ${engines}: ${source} and ${target} are identical`;
         }
       } else {

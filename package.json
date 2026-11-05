@@ -1,6 +1,6 @@
 {
   "name": "compare-databases",
-  "version": "1.0.8",
+  "version": "2.1.0",
   "description": "Compare Databases",
   "main": "main.js",
   "scripts": {
@@ -15,8 +15,9 @@
     "publish": {
       "provider": "github",
       "owner": "rabarvp1",
-      "repo": "compare-databases-releases",
-      "releaseType": "release"
+      "repo": "compare-databases",
+      "releaseType": "release",
+      "vPrefixedTagName": false
     },
     "win": {
       "target": "nsis",

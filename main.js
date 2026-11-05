@@ -264,7 +264,20 @@ const mysqlDriver = {
       ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
     `, [db]);
 
-    const schema = { db, tables: {}, fks: [] };
+    // Views, triggers and routines are not synced, but the compare lists the ones that differ
+    const [extras] = await session.conn.query(`
+      SELECT 'view' AS kind, TABLE_NAME AS name, VIEW_DEFINITION AS def
+      FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?
+      UNION ALL
+      SELECT 'trigger', CONCAT(EVENT_OBJECT_TABLE, '.', TRIGGER_NAME),
+             CONCAT(ACTION_TIMING, ' ', EVENT_MANIPULATION, ' ', ACTION_STATEMENT)
+      FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?
+      UNION ALL
+      SELECT LOWER(ROUTINE_TYPE), ROUTINE_NAME, ROUTINE_DEFINITION
+      FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ?
+    `, [db, db, db]);
+
+    const schema = { db, tables: {}, fks: [], extras };
     for (const t of tables) schema.tables[t.name] = { columns: [], indexes: [] };
     for (const c of columns) schema.tables[c.tbl]?.columns.push(c);
     for (const ix of groupConstraints(indexRows)) {
@@ -537,6 +550,24 @@ const postgresDriver = {
         )
         ORDER BY i.relname
       `, [ns]);
+      // Views, materialized views, functions/procedures and triggers are not synced, but the
+      // compare lists the ones that differ so they are never silently forgotten
+      const extras = await client.query(`
+        SELECT CASE c.relkind WHEN 'v' THEN 'view' ELSE 'materialized view' END AS kind, c.relname AS name,
+               pg_get_viewdef(c.oid) AS def
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relkind IN ('v', 'm')
+        UNION ALL
+        SELECT CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
+               p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', pg_get_functiondef(p.oid)
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = $1 AND p.prokind IN ('f', 'p')
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
+        UNION ALL
+        SELECT 'trigger', c.relname || '.' || t.tgname, pg_get_triggerdef(t.oid)
+        FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND NOT t.tgisinternal
+      `, [ns]);
       const enums = await client.query(`
         SELECT t.typname AS name, string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) AS labels
         FROM pg_type t
@@ -547,7 +578,7 @@ const postgresDriver = {
         ORDER BY t.typname
       `, [ns]);
 
-      const schema = { db, tables: {}, fks: [], enums: enums.rows };
+      const schema = { db, tables: {}, fks: [], enums: enums.rows, extras: extras.rows };
       for (const t of tables.rows) schema.tables[t.name] = { columns: [], constraints: [], indexes: [] };
       for (const c of columns.rows) schema.tables[c.tbl]?.columns.push(c);
       // pg_get_indexdef writes "ON public.t"; without the schema the index is created in the
@@ -780,7 +811,8 @@ function pgSafeName(name, used, key = name) {
 // Tables and columns remember their MySQL name in `source` for the data copy.
 function mysqlToPostgres(schema) {
   const q = postgresDriver.q;
-  const out = { db: schema.db, tables: {}, fks: [], enums: [] };
+  // MySQL views/triggers/routines are written in MySQL's SQL and can't be converted automatically
+  const out = { db: schema.db, tables: {}, fks: [], enums: [], extras: (schema.extras || []).map(e => ({ ...e, fromMysql: true })) };
 
   // Tables, indexes and the indexes behind primary/unique keys share one namespace per schema
   const relations = new Set();
@@ -994,11 +1026,31 @@ ipcMain.handle('compare-db', async (event, { source, target, sourceType, targetT
     let src = await srcSession.driver.loadSchema(srcSession, source);
     const tgt = await d.loadSchema(tgtSession, target);
     if (srcType !== tgtType) src = mysqlToPostgres(src);
-    return { success: true, sql: await buildSyncSql(d, srcSession, tgtSession, src, tgt) };
+    return { success: true, sql: await buildSyncSql(d, srcSession, tgtSession, src, tgt), notes: extrasNotes(src, tgt) };
   } catch (err) {
     return { success: false, error: dbErrorMessage(err) };
   }
 });
+
+// Views, materialized views, triggers and functions/procedures are not created or changed by
+// the sync script. This lists the ones that are missing or different, so nobody is surprised.
+function extrasNotes(src, tgt) {
+  const norm = def => String(def || '').replace(/\s+/g, ' ').replace(/\b(public|`[^`]+`)\./g, '').trim();
+  const key = e => `${e.kind}\0${e.name}`;
+  const have = new Map((tgt.extras || []).map(e => [key(e), e]));
+  const want = new Map((src.extras || []).map(e => [key(e), e]));
+  const notes = [];
+  for (const e of src.extras || []) {
+    const t = have.get(key(e));
+    if (e.fromMysql) notes.push(`MySQL ${e.kind} ${e.name} is written in MySQL's SQL and is not converted; create it by hand in PostgreSQL if you need it.`);
+    else if (!t) notes.push(`The ${e.kind} ${e.name} exists only in the source; this tool does not create it, so create it by hand if you need it.`);
+    else if (norm(t.def) !== norm(e.def)) notes.push(`The ${e.kind} ${e.name} is different in the target; this tool does not change it, so update it by hand if you need to.`);
+  }
+  for (const e of tgt.extras || []) {
+    if (!want.has(key(e))) notes.push(`The ${e.kind} ${e.name} exists only in the target and is left as it is.`);
+  }
+  return notes;
+}
 
 // Statements are ordered so every one of them runs against objects in the right state:
 // drop stale FKs -> drop stale indexes/checks -> create types/tables -> add columns ->
@@ -1156,6 +1208,10 @@ ipcMain.handle('run-sql', async (event, { target, sql }) => {
 
 // The structure change itself is fine; existing rows break the new rule
 function dataConflictHint(message) {
+  if (/other objects depend on it|depends on|is used by|dependent objects/i.test(message)) {
+    return '\n\nA view, materialized view or trigger uses this column or table (see the notes at the top of the script). ' +
+      'Drop that view or trigger first, run the script again, then create the view or trigger again.';
+  }
   if (/violates|is violated by some row|contains null values|Duplicate entry|could not create unique index|Data truncated|Cannot add or update a child row|Invalid use of NULL/i.test(message)) {
     return '\n\nSome existing rows in the target do not fit the new structure (for example a value no longer allowed, ' +
       'a duplicate in a new unique key, or a row whose parent is missing). Fix or remove those rows, then run again.';
@@ -1187,7 +1243,7 @@ async function loadConvertedSchema(source) {
 ipcMain.handle('convert-preview', async (event, { source }) => {
   try {
     const { srcSession, tgtSession, src } = await loadConvertedSchema(source);
-    return { success: true, sql: await buildSyncSql(postgresDriver, srcSession, tgtSession, src, EMPTY_SCHEMA) };
+    return { success: true, sql: await buildSyncSql(postgresDriver, srcSession, tgtSession, src, EMPTY_SCHEMA), notes: extrasNotes(src, EMPTY_SCHEMA) };
   } catch (err) {
     return { success: false, error: dbErrorMessage(err) };
   }
@@ -1317,6 +1373,17 @@ ipcMain.handle('convert-create', async (event, { source, newDb, existing, copyDa
       } catch (err) {
         await client.query('ROLLBACK TO SAVEPOINT fk');
         warnings.push(`Foreign key ${fk.name} on ${fk.table} was not added: ${err.message}`);
+      }
+    }
+    // Materialized views still hold the old rows; recompute them from the new data
+    for (const mv of (tgt.extras || []).filter(e => e.kind === 'materialized view')) {
+      await client.query('SAVEPOINT mv');
+      try {
+        await client.query(`REFRESH MATERIALIZED VIEW ${q(mv.name)}`);
+        await client.query('RELEASE SAVEPOINT mv');
+      } catch (err) {
+        await client.query('ROLLBACK TO SAVEPOINT mv');
+        warnings.push(`Materialized view ${mv.name} could not be refreshed: ${err.message}`);
       }
     }
     await client.query('COMMIT');
